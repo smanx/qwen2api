@@ -1,10 +1,5 @@
 {
   "version": 2,
-  "functions": {
-    "api/**/*.js": {
-      "runtime": "nodejs20.x"
-    }
-  },
   "routes": [
     { "src": "/v1/models", "dest": "/api/index.js" },
     { "src": "/v1/chat/completions", "dest": "/api/index.js" },
