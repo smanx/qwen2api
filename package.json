@@ -14,7 +14,6 @@
   "type": "commonjs",
   "dependencies": {
     "express": "^5.2.1",
-    "puppeteer": "^24.37.5",
     "uuid": "^13.0.0"
   },
   "devDependencies": {
