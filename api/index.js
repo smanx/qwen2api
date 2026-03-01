@@ -1,40 +1,42 @@
 /**
- * Vercel / Node.js Serverless 入口
+ * Vercel Serverless 入口
  */
 
 const { handleModels, handleChatCompletions, handleRoot, createResponse } = require('../core.js');
 
-module.exports = async function handler(req, res) {
+module.exports = async (req, res) => {
   // 处理 CORS preflight
   if (req.method === 'OPTIONS') {
-    return res ? res.status(200).end() : createResponse('', 200);
+    return res.status(200).end();
   }
   
-  const authHeader = req.headers?.authorization || req.headers?.Authorization || '';
-  const path = req.url || req.path || '';
+  const authHeader = req.headers?.authorization || '';
+  const path = req.url || '';
   
-  // 模型列表
-  if (req.method === 'GET' && path.includes('/v1/models')) {
-    const result = await handleModels(authHeader);
-    if (res) return res.status(result.statusCode).set(result.headers).send(result.body);
-    return result;
+  try {
+    // 模型列表
+    if (req.method === 'GET' && path.includes('/v1/models')) {
+      const result = await handleModels(authHeader);
+      return res.status(result.statusCode).set(result.headers).send(result.body);
+    }
+    
+    // 聊天完成
+    if (req.method === 'POST' && path.includes('/v1/chat/completions')) {
+      const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+      const result = await handleChatCompletions(body, authHeader);
+      return res.status(result.statusCode).set(result.headers).send(result.body);
+    }
+    
+    // 根路径
+    if (req.method === 'GET' && (path === '/' || path === '')) {
+      const result = handleRoot();
+      return res.status(200).set(result.headers).send(result.body);
+    }
+    
+    // 404
+    return res.status(404).json({ error: { message: 'Not found' } });
+  } catch (error) {
+    console.error('Handler error:', error);
+    return res.status(500).json({ error: { message: error.message } });
   }
-  
-  // 聊天完成
-  if (req.method === 'POST' && path.includes('/v1/chat/completions')) {
-    const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
-    const result = await handleChatCompletions(body, authHeader);
-    if (res) return res.status(result.statusCode).set(result.headers).send(result.body);
-    return result;
-  }
-  
-  // 根路径
-  if (req.method === 'GET' && (path === '/' || path.endsWith('/'))) {
-    const result = handleRoot();
-    if (res) return res.status(200).set(result.headers).send(result.body);
-    return result;
-  }
-  
-  // 404
-  return res ? res.status(404).json({ error: { message: 'Not found' } }) : createResponse({ error: { message: 'Not found' } }, 404);
 };
