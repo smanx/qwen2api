@@ -6,7 +6,7 @@ app.use(express.json());
 
 // 从环境变量或直接配置获取 JWT Token
 const AUTH_TOKEN = process.env.QWEN_TOKEN || `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjhkMTE4ZjI3LWFlNzItNDBhZC05YjIwLTY0MWMzZDAxMWVkMiIsImxhc3RfcGFzc3dvcmRfY2hhbmdlIjoxNzcyMzA0MjExLCJleHAiOjE3NzQ4OTY2NDB9.hCR1c8MfUWyIbNtrvON8jA80CyAExabdCCZDvkL_mRA`;
-
+// const AUTH_TOKEN = process.env.QWEN_TOKEN 
 // 延迟加载 baxia-token 模块
 let baxiaModule = null;
 
@@ -119,9 +119,9 @@ app.post('/v1/chat/completions', async (req, res) => {
     const lastUserMessage = messages.filter(m => m.role === 'user').pop();
     const userContent = lastUserMessage ? lastUserMessage.content : 'hello';
     
-    // 动态获取 baxia tokens (使用浏览器获取正确格式的 token)
-    const fetchBaxia = await getFetchBaxiaModule();
-    const { bxUa, bxUmidToken, bxV } = await fetchBaxia.getBaxiaTokens();
+    // 动态获取 baxia tokens (纯 Node.js 实现，无需浏览器)
+    const baxiaNode = require('./baxia-node');
+    const { bxUa, bxUmidToken, bxV } = await baxiaNode.getBaxiaTokensNode({ silent: true });
     
     console.log('[API] Got baxia tokens:', { bxUaLength: bxUa.length, bxUmidToken: bxUmidToken.substring(0, 20) + '...', bxV });
     
