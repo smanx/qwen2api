@@ -150,6 +150,10 @@ async function handleChatCompletions(body, authHeader, env) {
   const actualModel = model || 'qwen3.5-plus';
   const { bxUa, bxUmidToken, bxV } = await getBaxiaTokens();
 
+  // 检查是否启用搜索
+  const enableSearch = (env.ENABLE_SEARCH || '').toLowerCase() === 'true';
+  const chatType = enableSearch ? 'search' : 't2t';
+
   // 创建会话
   const createResp = await fetch('https://chat.qwen.ai/api/v2/chats/new', {
     method: 'POST',
@@ -161,7 +165,7 @@ async function handleChatCompletions(body, authHeader, env) {
       'x-request-id': uuidv4()
     },
     body: JSON.stringify({
-      title: '新建对话', models: [actualModel], chat_mode: 'guest', chat_type: 't2t',
+      title: '新建对话', models: [actualModel], chat_mode: 'guest', chat_type: chatType,
       timestamp: Date.now(), project_id: ''
     })
   });
@@ -190,9 +194,9 @@ async function handleChatCompletions(body, authHeader, env) {
       chat_id: chatId, chat_mode: 'guest', model: actualModel, parent_id: null,
       messages: [{
         fid: uuidv4(), parentId: null, childrenIds: [uuidv4()], role: 'user', content,
-        user_action: 'chat', files: [], timestamp: Date.now(), models: [actualModel], chat_type: 't2t',
-        feature_config: { thinking_enabled: true, output_schema: 'phase', research_mode: 'normal', auto_thinking: true, thinking_format: 'summary', auto_search: true },
-        extra: { meta: { subChatType: 't2t' } }, sub_chat_type: 't2t', parent_id: null
+        user_action: 'chat', files: [], timestamp: Date.now(), models: [actualModel], chat_type: chatType,
+        feature_config: { thinking_enabled: true, output_schema: 'phase', research_mode: 'normal', auto_thinking: true, thinking_format: 'summary', auto_search: enableSearch },
+        extra: { meta: { subChatType: chatType } }, sub_chat_type: chatType, parent_id: null
       }],
       timestamp: Date.now()
     })
