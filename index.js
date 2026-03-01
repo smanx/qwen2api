@@ -52,7 +52,17 @@ app.post('/v1/chat/completions', async (req, res) => {
     console.log(`[API] Chat request: model=${model || 'qwen3.5-flash'}, stream=${stream}`);
     
     const actualModel = model || 'qwen3.5-flash';
+    console.log(`[API] Chat request: model=${actualModel}, stream=${stream}, messages=${JSON.stringify(messages)}`);
+    
     const result = await sendChatRequest(AUTH_TOKEN, messages, actualModel, stream);
+    
+    console.log(`[API] Result: error=${result.error || 'none'}, dataType=${typeof result.data}, dataLength=${result.data ? result.data.length : 'N/A'}`);
+    if (result.responseInfo) {
+      console.log(`[API] Response info: status=${result.responseInfo.status}, contentType=${result.responseInfo.contentType}`);
+    }
+    if (result.error && result.data) {
+      console.log(`[API] Error data: ${result.data.substring(0, 500)}`);
+    }
 
     if (result.error) {
       console.error('[API] Chat error:', result.error);
@@ -74,9 +84,17 @@ app.post('/v1/chat/completions', async (req, res) => {
       
       const lines = responseStr.split('\n').filter(line => line.startsWith('data: '));
       
+      // 所有 chunk 使用同一个 ID
+      const responseId = `chatcmpl-${uuidv4()}`;
+      const created = Math.floor(Date.now() / 1000);
+      
+      console.log(`[API] Processing ${lines.length} SSE lines, responseId=${responseId}`);
+      
+      let contentChunks = 0;
       for (const line of lines) {
         const data = line.slice(6).trim();
         if (data === '[DONE]') {
+          console.log(`[API] Sending [DONE], total content chunks: ${contentChunks}`);
           res.write('data: [DONE]\n\n');
           continue;
         }
@@ -86,9 +104,9 @@ app.post('/v1/chat/completions', async (req, res) => {
           
           // 转换为 OpenAI 格式
           const openAIChunk = {
-            id: `chatcmpl-${uuidv4()}`,
+            id: responseId,
             object: 'chat.completion.chunk',
-            created: Math.floor(Date.now() / 1000),
+            created: created,
             model: actualModel,
             choices: [{
               index: 0,
@@ -100,10 +118,11 @@ app.post('/v1/chat/completions', async (req, res) => {
           if (parsed.choices && parsed.choices[0]) {
             const choice = parsed.choices[0];
             
-            if (choice.delta) {
+            if (choice.delta && choice.delta.content) {
               openAIChunk.choices[0].delta = {
-                content: choice.delta.content || '',
+                content: choice.delta.content,
               };
+              contentChunks++;
             }
             
             if (choice.finish_reason) {
@@ -113,9 +132,11 @@ app.post('/v1/chat/completions', async (req, res) => {
           
           res.write(`data: ${JSON.stringify(openAIChunk)}\n\n`);
         } catch (e) {
-          // 跳过解析错误
+          console.log(`[API] Parse error: ${e.message}, line: ${line.substring(0, 100)}`);
         }
       }
+      
+      console.log(`[API] Stream completed, total content chunks sent: ${contentChunks}`);
       
       res.write('data: [DONE]\n\n');
       res.end();

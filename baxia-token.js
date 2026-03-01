@@ -9,6 +9,8 @@ const { v4: uuidv4 } = require('uuid');
 // 缓存
 let browserInstance = null;
 let pageInstance = null;
+let currentChatId = null;  // 当前活跃的聊天会话 ID
+let lastChatModel = null;  // 上一次使用的模型
 
 /**
  * 获取或创建 browser 实例
@@ -146,25 +148,51 @@ async function createChat(authToken, model = 'qwen3.5-plus') {
 
 /**
  * 在浏览器中发送聊天请求
+ * @param {string} authToken - JWT token
+ * @param {Array} messages - 消息数组
+ * @param {string} model - 模型名称
+ * @param {boolean} stream - 是否流式
+ * @param {string} chatId - 可选的聊天会话 ID，用于连续对话
  */
-async function sendChatRequest(authToken, messages, model = 'qwen3.5-plus', stream = true) {
-  // 先创建聊天会话
-  const chatCreateResult = await createChat(authToken, model);
-  if (!chatCreateResult.success) {
-    return { error: 'Failed to create chat', details: chatCreateResult };
-  }
+async function sendChatRequest(authToken, messages, model = 'qwen3.5-plus', stream = true, chatId = null) {
+  // 如果没有提供 chatId，决定是否复用现有会话
+  const hasHistory = messages.length > 1;
   
-  const chatId = chatCreateResult.data?.data?.id || uuidv4();
-  console.log(`[Qwen] Created chat: ${chatId}`);
+  if (!chatId) {
+    // 如果模型相同，复用会话（不管是否有历史对话）
+    if (currentChatId && lastChatModel === model) {
+      chatId = currentChatId;
+      console.log(`[Qwen] Reusing chat session: ${chatId} (hasHistory: ${hasHistory})`);
+    } else {
+      // 创建新的聊天会话
+      const chatCreateResult = await createChat(authToken, model);
+      if (!chatCreateResult.success) {
+        return { error: 'Failed to create chat', details: chatCreateResult };
+      }
+      
+      chatId = chatCreateResult.data?.data?.id || uuidv4();
+      currentChatId = chatId;
+      lastChatModel = model;
+      console.log(`[Qwen] Created new chat: ${chatId} (hasHistory: ${hasHistory})`);
+    }
+  }
   
   const page = await getAuthenticatedPage(authToken);
   const requestId = uuidv4();
   const timezone = new Date().toUTCString();
   
-  console.log(`[Qwen] Sending chat request: model=${model}, stream=${stream}`);
+  console.log(`[Qwen] Sending chat request: model=${model}, stream=${stream}, chatId=${chatId}`);
+  console.log(`[Qwen] Original messages count: ${messages.length}`);
+  
+  // Qwen API 不支持在 messages 中发送多条消息（包括历史对话）
+  // 只发送最后一条用户消息
+  const lastUserMessage = messages.filter(m => m.role === 'user').pop();
+  const messagesToSend = lastUserMessage ? [lastUserMessage] : messages;
+  
+  console.log(`[Qwen] Messages to send: ${messagesToSend.length}`);
   
   // 将 OpenAI 格式的 messages 转换为 Qwen 格式
-  const qwenMessages = messages.map(msg => {
+  const qwenMessages = messagesToSend.map(msg => {
     if (msg.role === 'user') {
       return buildQwenMessage(msg.content, 'user');
     } else if (msg.role === 'assistant') {
@@ -202,7 +230,7 @@ async function sendChatRequest(authToken, messages, model = 'qwen3.5-plus', stre
         headers: {
           'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json',
-          'Accept': 'application/json',
+          'Accept': 'application/json, text/event-stream',
           'x-request-id': requestId,
           'timezone': timezone,
           'source': 'web',
@@ -216,8 +244,11 @@ async function sendChatRequest(authToken, messages, model = 'qwen3.5-plus', stre
       
       if (!response.ok) {
         const text = await response.text();
-        return { error: `HTTP ${response.status}`, body: text };
+        return { error: `HTTP ${response.status}`, body: text, status: response.status, contentType };
       }
+      
+      // 返回响应信息供调试
+      const responseInfo = { status: response.status, contentType };
       
       if (stream && contentType.includes('text/event-stream')) {
         // 流式响应
@@ -231,11 +262,17 @@ async function sendChatRequest(authToken, messages, model = 'qwen3.5-plus', stre
           chunks.push(decoder.decode(value, { stream: true }));
         }
         
-        return { stream: true, data: chunks.join('') };
+        const fullData = chunks.join('');
+        return { stream: true, data: fullData, responseInfo };
       } else {
-        // 非流式
-        const data = await response.json();
-        return { success: true, data };
+        // 非流式或非预期格式
+        const text = await response.text();
+        return { 
+          success: false, 
+          error: `Unexpected content-type: ${contentType}`, 
+          data: text,
+          responseInfo 
+        };
       }
     } catch (e) {
       return { error: e.message };
