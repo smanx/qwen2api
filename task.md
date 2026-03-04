@@ -78,6 +78,35 @@ fetch("https://chat.qwen.ai/api/v2/users/status", {
   "method": "POST"
 });
 ```
+
+如果上传的是文本内容，需要调用这个接口
+```
+fetch("https://chat.qwen.ai/api/v2/files/parse", {
+  "headers": {
+    "accept": "application/json, text/plain, */*",
+    "accept-language": "zh-CN,zh;q=0.9",
+    "bx-ua": "231!0RD3ZAmUrLE+jmjkdk3YfwDjU0EFbxIPhmaHlkqUue5zXG3b+3lFomgS3e54458zDKuHYed6RCYFxbi3xIH64a4UdqS75YSvKMRmt5MLmrrs0jsWwJaypbEjdQlpUg9wR5VxTQEPZBplT0xfZWUFN6GJyw0Ut4/YE51fAJDyEmxsYRUSRXE+XV4TaxXUB7ypczH9SAvq5WVKjskf9tc7Iu5vocQhWeAkCt7HL99T9m7mm0ISQ5Wp/iD+Aw8e+Zd++6WF1cGxpj2wHJBh+++j+ygU3+jOKG/IRlVeFkk3+kYqkP6CoHPu4F2UyPhuUvezCj+KPpbxHYAIeu8QBme0hrqWiHC1+HzQZXRjev5SLf1MjfKIIh8LZBAjrXbZdk1ygZygRH0OBwEerxQZychfMmQxIpQ1yFHd4g22zovpzqdQHrbCymTy4XMJaeJas6zmztKQNI3JYpQTyF5gaQMGH8XAfu3U6WRUy+VRsgiM0aDncn+nP2ytpRjejIvBggVxxg1PKOKeqVoOaLZeqVCI407MCaFBt3JGcuKHu2KtNswnNP6ZBW80TPOvt3jc80ZBMycNcdIirReylvAsP4eX0vL0nxKEeOgNR9xT1FgnVuwn0DvHjL0XGj0SyzM94Af+bJ73HLWXnvDT0ZCMzBedauiPaV3umz8ZKmRYhpI9yd/RZMnB0oQcQqlmuqg8QJI/mxW3uZi2cHobti9bY0huuxkZLQp6u4hgtCWtGuG5VkE4mpwS3Cqi4xfX1mSSCAULm2fabRyn9PDHHbUSDlXpHs/fVJAiptTFqeCYjOpBI6411w/ny8wxcq2V8KmQUH4QNaRCutPWEKnUlB/I6sJ+e5DHimnrxUF0TdvyYH5dgupZb4I03BoXq44qTVpyR3KTpDl147GGz7fBKja+EedYQrJnHLrw1Nx1sPJNUSXaGyMSS21kymGB6GyS5jJlR9+3oAr/XlhLboMw8ABVekLE+nXxSxCL93MzhVLVOj0QIDtZTk2NZUHQMHNZsBf1Uq5EsG10EaW/6zWv9zLE7qJ1bUs4gOssQB5xF7skH1mKWwZv72C8qELJCvjU163CXAKpiNR59zPzKnGG+R6rKG+/oc0JMUnkMW8pq6e8r0fxUzxJHFmb8wAACdwleo+WM5xuszFCZLR/E5VsrB4n4NHxIcVpqbM4yEc8etBB4lq5oixu9L2750J9o0PoOeic0s7x1ItC7Xi4gC7yczZR1WHfwfnoDhANnXRRJ7Ah8JxBUcKEljyv3eqwJPqZbzvWYrJ59gwDUkT/trVhWNmLkySDB7COq6D3VMjCpp4lXzFztpMIwDq4qu3IKQ1sgmQ2oFrjGpgs0IVVgk+zLzSFB9ymbSfzNDbevMHdSYDi2C4khBemN7X4+Sv6xm+dCoSLJR5lBUCuQhAVLP/Lb1BFT6gqCq6ZL2FKKQfkiKmB+pZtFnYk0zvNKGnhYIcS7QrV1J/oRkbtHgYbdozNPjSse6BB4uz1EPFlmA+QeJL4mrtJRgeYqOZbU1LrplUKmA5mOuqXXLEJyrH/ZAEs8mvekeF7g0QV3Hwfwze8Bvjt",
+    "bx-umidtoken": "T2gAVrmvhlAACH_GKMjBxJYld5hhNlVCT0JK-uuJVrk6Als01ux4osYsi5vIvWL_tWs=",
+    "bx-v": "2.5.36",
+    "content-type": "application/json",
+    "sec-ch-ua": "\"Not:A-Brand\";v=\"99\", \"Google Chrome\";v=\"145\", \"Chromium\";v=\"145\"",
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": "\"Windows\"",
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
+    "source": "web",
+    "timezone": "Wed Mar 04 2026 16:08:37 GMT+0800",
+    "x-request-id": "73911886-e23b-4784-aeeb-a29ced4f7b83",
+    "cookie": "_gcl_au=1.1.2040236964.1771812821; _bl_uid=32m7bl3LyUsj2klkUwgec8L7b14p; cna=26UiIj2An1ICAWgcmKtujklv; x-ap=cn-hongkong; sca=b1e049e0; xlly_s=1; acw_tc=0a06abd717726116753887494e23927e7d6ae8568389af1d8dad9a9023334a; atpsida=e8d34f72bb70203b7829365b_1772611677_1; tfstk=ggqsZLv4_CA1DOXOMCWeNHH6VeifU9SrCKMYE-KwHcntGKN4eqHwbO4bRSPs6SwcIxhYMSG47wSzIRmmD_lf4gyihBfxD5gt6JBxHYpOLVIAWP6ID_5PYYAV9CmYQWEPQJeKtxttHnFvJJhnhALTMf3p9YMoDjFYMpLKIYcxBVKx99Mm9jnxDSnddxlKMmnYMJhuq6Mh5fe1h8bJ6Qbp9RlBDnEIpsc8CO-jLkDs5betlnKAnAgswRhd1xJwi2emlovDcqwTrSD86CCrS-UQOAifYFn8drFSKlIy1v4ap8lLFK-4IcMjym3BHneIXy07A0IJOv4LQrEg1KtxIlrrlb0CHn0qvuu8y59cEJntHS0u0_xi6-euqzo5YFn8drF7lgu64bsnPE9IrnMIa96BoEmoC8hbepR6LVHnLuWCdCTmWvDIa96BoE0tKvuPd9O6o; isg=BH19Cj8jyDvDe2zrGKuUMVSqjNl3GrFspEhcRz_CLlQDdp-oB2pDPRZgIKowLskk; ssxmod_itna=1-Yq0xyQ0QDQING0D2DRxQKhDAx7weWu4iODzxCvYG7DuxiK08D6QDBb46eHdEnwHUheami8DroDBqeoDSxD67DK4GTm_Eh04zCQjBqAmbK7GR2NoBGmD5=YcjY10PYvN5W44fglrggneRhtSBrdDU4GnD06eK7dbDYAEDBYD74G_DDeDiO3Dj4GmDGANseDF0nTroPToPxDwDB=Dmu4r0eDEDG3D04uxGkh=HDDlF0BPm0aiDYPQqZiOP24DAdhipi4Qx0UaDBLNSt7DGuk0HBni6KMprbb7hPGuDG=kVQrdAOuW5Z2pohrm0YbAp4i4/YxhiD3lKnAxzihNix30hxAx37Dq/LilxtnDzQ0NfPDneYc_FnitYhM_5Z0mZ05oYDNRT1emFbD4SY5NDPYrNMrt2IxSht=AeOq4/iwmDxEGDD; ssxmod_itna2=1-Yq0xyQ0QDQING0D2DRxQKhDAx7weWu4iODzxCvYG7DuxiK08D6QDBb46eHdEnwHUheami8DrD=r8xopQkUCoPz/mnL5vPsz9QxNxD",
+    "Referer": "https://chat.qwen.ai/"
+  },
+  "body": "{\"file_id\":\"9ab1b6fa-bfbd-4208-ba09-de73b82a408a\"}",
+  "method": "POST"
+});
+```
+
+
 查询上传文件的状态返回的数据
 ```
 {"success":true,"request_id":"13ca023f-8ec8-418f-814e-367107a09bbd","data":true}

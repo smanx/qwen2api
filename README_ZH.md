@@ -68,13 +68,29 @@ wrangler deploy
 
 ## 注意事项
 
-- ⚠️ 本项目 API 只支持纯文本对话，不支持图片、文件等多模态内容
+- ✅ `/v1/chat/completions` 已支持附件与多模态消息（图片/文件/音频）。
+- ⚠️ 附件会按 Qwen Web 的流程先上传到 Qwen OSS，文件较大时请求耗时会增加。
+
+### 附件兼容格式（OpenAI 风格）
+
+`messages[].content` 支持以下分段格式：
+
+- `{"type":"text","text":"..."}` / `{"type":"input_text","input_text":"..."}`
+- `{"type":"image_url","image_url":{"url":"https://..."}}`
+- `{"type":"input_image","image_url":"https://..."}`
+- `{"type":"file","file_data":"data:...base64,...","filename":"a.pdf"}`
+- `{"type":"input_file","file_data":"<base64>","filename":"a.txt"}`
+- `{"type":"audio","file_data":"https://..."}` / `{"type":"input_audio", ...}`
+
+另外也兼容消息级 `files` / `attachments` 传参。
 
 ## 环境变量
 
 | 变量名 | 说明 | 必填 |
 |--------|------|------|
 | `API_TOKENS` | API 密钥，多个用逗号分隔 | 否 |
+| `CHAT_DETAIL_LOG` | 是否开启详细对话/上传日志（`true/1/on/yes` 开启，默认关闭） | 否 |
+| `JSON_BODY_LIMIT` | Express JSON 请求体大小上限（默认 `20mb`，仅本地/Docker 的 Express 运行时生效） | 否 |
 
 > **注意：** 所有模型现已默认开启联网搜索功能，`ENABLE_SEARCH` 变量已废弃。
 

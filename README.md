@@ -68,13 +68,29 @@ Two public services are available for testing:
 
 ## Important Notes
 
-- ⚠️ This API only supports plain text conversations; multimodal content such as images and files is not supported
+- ✅ The `/v1/chat/completions` endpoint now supports attachments and multimodal message parts, including image/file/audio inputs.
+- ⚠️ Attachments are uploaded to Qwen OSS through the same workflow used by Qwen Web, so request latency increases when sending large files.
+
+### Attachment Compatibility (OpenAI-style)
+
+You can use these message content part formats in `messages[].content` arrays:
+
+- `{"type":"text","text":"..."}` / `{"type":"input_text","input_text":"..."}`
+- `{"type":"image_url","image_url":{"url":"https://..."}}`
+- `{"type":"input_image","image_url":"https://..."}`
+- `{"type":"file","file_data":"data:...base64,...","filename":"a.pdf"}`
+- `{"type":"input_file","file_data":"<base64>","filename":"a.txt"}`
+- `{"type":"audio","file_data":"https://..."}` / `{"type":"input_audio", ...}`
+
+The proxy also accepts legacy message-level `files` / `attachments` arrays for compatibility.
 
 ## Environment Variables
 
 | Variable | Description | Required |
 |----------|-------------|----------|
 | `API_TOKENS` | API keys, multiple keys separated by commas | No |
+| `CHAT_DETAIL_LOG` | Enable detailed chat/upload logs (`true/1/on/yes` to enable, default off) | No |
+| `JSON_BODY_LIMIT` | Express JSON body size limit (default `20mb`, only for local/Docker Express runtime) | No |
 
 > **Note:** Web search is now enabled by default for all models. The `ENABLE_SEARCH` variable has been deprecated.
 

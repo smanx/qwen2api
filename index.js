@@ -94,7 +94,21 @@ async function serverlessHandler(req, res) {
 function startExpressServer() {
   const express = require('express');
   const app = express();
-  app.use(express.json());
+  const jsonLimit = process.env.JSON_BODY_LIMIT || '20mb';
+  app.use(express.json({ limit: jsonLimit }));
+
+  app.use((error, req, res, next) => {
+    if (!error) return next();
+    if (error.type === 'entity.too.large' || error.status === 413) {
+      return res.status(413).json({
+        error: {
+          message: `Payload too large. Current JSON body limit is ${jsonLimit}. You can increase it with JSON_BODY_LIMIT.`,
+          type: 'invalid_request_error',
+        },
+      });
+    }
+    return next(error);
+  });
 
   // Token 验证中间件
   function authMiddleware(req, res, next) {
