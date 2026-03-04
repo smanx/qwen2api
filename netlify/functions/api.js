@@ -2,7 +2,7 @@
  * Netlify Functions 入口
  */
 
-const { handleModels, handleChatCompletions, handleRoot, createResponse } = require('../../core.js');
+const { handleModels, handleChatCompletions, handleRoot, handleChatPage, createResponse } = require('../../core.js');
 
 exports.handler = async (event, context) => {
   if (event.httpMethod === 'OPTIONS') {
@@ -11,6 +11,7 @@ exports.handler = async (event, context) => {
 
   const authHeader = event.headers?.authorization || event.headers?.Authorization || '';
   const path = event.path || '';
+  const pathname = typeof path === 'string' ? path.split('?')[0] : '';
 
   if (event.httpMethod === 'GET' && path.includes('/v1/models')) {
     return handleModels(authHeader);
@@ -21,6 +22,9 @@ exports.handler = async (event, context) => {
   }
   if (event.httpMethod === 'GET' && (path === '/' || path === '')) {
     return handleRoot();
+  }
+  if (event.httpMethod === 'GET' && (pathname === '/chat' || pathname === '/chat/')) {
+    return handleChatPage();
   }
   
   return createResponse({ error: { message: 'Not found' } }, 404);

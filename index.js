@@ -4,7 +4,7 @@
  * 支持: Docker (Express) / Vercel / Netlify
  */
 
-const { handleModels, handleChatCompletions, handleRoot, createResponse, validateToken, uuidv4 } = require('./core.js');
+const { handleModels, handleChatCompletions, handleRoot, handleChatPage, createResponse, validateToken, uuidv4 } = require('./core.js');
 
 // ============================================
 // Express Stream Handler
@@ -26,41 +26,82 @@ function createExpressStreamHandler(res) {
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     
-    const reader = response.body.getReader();
+    const reader = response.body?.getReader ? response.body.getReader() : null;
     const decoder = new TextDecoder();
     let buffer = '';
-    
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-      
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const data = line.slice(6).trim();
-        if (data === '[DONE]') {
-          res.write('data: [DONE]\n\n');
-          continue;
-        }
-        
-        try {
-          const parsed = JSON.parse(data);
-          if (parsed.choices?.[0]?.delta?.content) {
-            writeStreamContent(parsed.choices[0].delta.content);
-            const chunk = {
-              id: responseId, object: 'chat.completion.chunk', created, model,
-              choices: [{ index: 0, delta: { content: parsed.choices[0].delta.content }, finish_reason: parsed.choices[0].finish_reason || null }]
-            };
-            res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+    let doneWritten = false;
+
+    try {
+      if (!reader) {
+        throw new Error('Upstream response has no readable body');
+      }
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          const trimmed = line.trimStart();
+          if (!trimmed.startsWith('data:')) continue;
+          const data = trimmed.slice(5).trim();
+          if (data === '[DONE]') {
+            res.write('data: [DONE]\n\n');
+            doneWritten = true;
+            continue;
           }
-        } catch {}
+
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed?.error) {
+              const errObj = typeof parsed.error === 'string'
+                ? { error: { message: parsed.error, type: 'api_error' } }
+                : { error: parsed.error };
+              res.write(`data: ${JSON.stringify(errObj)}\n\n`);
+              continue;
+            }
+
+            const delta = parsed?.choices?.[0]?.delta;
+            if (delta && typeof delta === 'object') {
+              if (typeof delta.content === 'string' && delta.content) {
+                writeStreamContent(delta.content);
+              }
+              const chunk = {
+                id: responseId,
+                object: 'chat.completion.chunk',
+                created,
+                model,
+                choices: [{
+                  index: 0,
+                  delta: {
+                    ...(typeof delta.role === 'string' ? { role: delta.role } : {}),
+                    ...(typeof delta.content === 'string' ? { content: delta.content } : {}),
+                  },
+                  finish_reason: parsed?.choices?.[0]?.finish_reason || null,
+                }],
+              };
+              res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+            }
+          } catch {}
+        }
+      }
+    } catch (err) {
+      if (!res.writableEnded) {
+        const message = err && err.message ? err.message : 'stream proxy error';
+        res.write(`data: ${JSON.stringify({ error: { message } })}\n\n`);
+      }
+    } finally {
+      if (!doneWritten && !res.writableEnded) {
+        res.write('data: [DONE]\n\n');
+      }
+      if (!res.writableEnded) {
+        res.end();
       }
     }
-    res.write('data: [DONE]\n\n');
-    res.end();
+
     if (debugEnabled && hasStreamContent) {
       process.stdout.write('\n');
       console.log('[qwen2api][express][stream] 输出完毕');
@@ -79,6 +120,10 @@ async function serverlessHandler(req, res) {
   
   const authHeader = req.headers?.authorization || req.headers?.Authorization || '';
   const path = req.url || req.path || '';
+  let pathname = path;
+  try {
+    pathname = new URL(path, 'http://localhost').pathname;
+  } catch {}
   
   if (req.method === 'GET' && path.includes('/v1/models')) {
     const result = await handleModels(authHeader);
@@ -93,6 +138,12 @@ async function serverlessHandler(req, res) {
     return result;
   }
   
+  if (req.method === 'GET' && (pathname === '/chat' || pathname === '/chat/')) {
+    const result = handleChatPage();
+    if (res) return res.status(200).set(result.headers).send(result.body);
+    return result;
+  }
+
   if (req.method === 'GET' && (path === '/' || path.endsWith('/'))) {
     const result = handleRoot();
     if (res) return res.status(200).set(result.headers).send(result.body);
@@ -144,6 +195,11 @@ function startExpressServer() {
 
   app.get('/', (req, res) => {
     const result = handleRoot();
+    res.status(200).set(result.headers).send(result.body);
+  });
+
+  app.get('/chat', (req, res) => {
+    const result = handleChatPage();
     res.status(200).set(result.headers).send(result.body);
   });
 
