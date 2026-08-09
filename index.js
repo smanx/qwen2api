@@ -4,7 +4,7 @@
  * 支持: Docker (Express) / Vercel / Netlify
  */
 
-const { handleModels, handleChatCompletions, handleChatCompletionsWithLogs, handleImageGenerations, handleRoot, handleChatPage, createResponse, validateToken, uuidv4, mapUpstreamDeltaToOpenAI, tryParseUpstreamErrorPayload } = require('./core.js');
+const { handleModels, handleChatCompletions, handleChatCompletionsWithLogs, handleImageGenerations, handleVideoGenerations, handleRoot, handleChatPage, createResponse, validateToken, uuidv4, mapUpstreamDeltaToOpenAI, tryParseUpstreamErrorPayload } = require('./core.js');
 
 function tryParseJson(text) {
   if (typeof text !== 'string') return null;
@@ -401,6 +401,25 @@ async function serverlessHandler(req, res) {
     return result;
   }
 
+  if (req.method === 'POST' && normalizedPathname === '/v1/videos/generations') {
+    logRequestPathBegin('serverless', normalizedPathname);
+    let body;
+    try {
+      if (typeof req.body === 'string') {
+        body = tryParseJson(req.body) || tryParseLooseJson(req.body) || {};
+      } else {
+        body = req.body || {};
+      }
+    } catch {
+      const bad = createResponse({ error: { message: 'Invalid JSON body.', type: 'invalid_request_error' } }, 400);
+      if (res) return res.status(bad.statusCode).set(bad.headers).send(bad.body);
+      return bad;
+    }
+    const result = await handleVideoGenerations(body, authHeader);
+    if (res) return res.status(result.statusCode).set(result.headers).send(result.body);
+    return result;
+  }
+
   if (req.method === 'GET' && (normalizedPathname === '/chat' || normalizedPathname === '/chat/')) {
     const result = handleChatPage();
     if (res) return res.status(200).set(result.headers).send(result.body);
@@ -525,6 +544,12 @@ function startExpressServer() {
   app.post('/v1/images/generations', authMiddleware, async (req, res) => {
     logRequestPathBegin('express', req.path || '/v1/images/generations');
     const result = await handleImageGenerations(req.body, req.headers.authorization);
+    res.status(result.statusCode).set(result.headers).send(result.body);
+  });
+
+  app.post('/v1/videos/generations', authMiddleware, async (req, res) => {
+    logRequestPathBegin('express', req.path || '/v1/videos/generations');
+    const result = await handleVideoGenerations(req.body, req.headers.authorization);
     res.status(result.statusCode).set(result.headers).send(result.body);
   });
 
