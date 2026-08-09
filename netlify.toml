@@ -11,5 +11,15 @@
   function = "api"
 
 [[edge_functions]]
+  path = "/v1/videos/generations"
+  function = "api"
+
+[[edge_functions]]
   path = "/*"
   function = "api"
+
+# Deploy note: Netlify Edge Functions are serverless and CANNOT run Chromium,
+# so they use the simplified baxia token (wu.json) with lower stability.
+# Text-to-video (/v1/videos/generations) is gated behind an authenticated Qwen
+# session — set the QWEN_COOKIE environment variable in the Netlify dashboard,
+# or pass "qwen_cookie" in the request JSON. Keep this site private.

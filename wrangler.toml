@@ -4,6 +4,7 @@ compatibility_date = "2024-01-01"
 
 [vars]
 API_TOKENS = ""
+QWEN_COOKIE = ""
 
 # 支持 .html 文件作为文本导入
 [[rules]]

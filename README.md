@@ -99,21 +99,21 @@ Set the environment variable `API_TOKENS` in the Cloudflare Dashboard.
 
 ### Platform Comparison
 
-| Aspect | Local Node / Docker | Vercel / Netlify / CF Workers |
-|--------|---------------------|-------------------------------|
-| Chromium (real baxia SDK) | ✅ Yes (stable token) | ❌ No |
-| Token acquisition | Real `T2gAv_` token + cookies (25-min cache) | Simplified token (`wu.json`), low stability |
-| Upstream risk control | Rarely blocked | Intermittently blocked (mitigated by retry) |
-| Video URL / large files | ✅ Supported (needs yt-dlp) | ❌ Not supported (serverless limits) |
-| Use case | Self-hosted, daily use | Quick deploy, light testing |
+| Aspect                    | Local Node / Docker                          | Vercel / Netlify / CF Workers               |
+| ------------------------- | -------------------------------------------- | ------------------------------------------- |
+| Chromium (real baxia SDK) | ✅ Yes (stable token)                        | ❌ No                                       |
+| Token acquisition         | Real `T2gAv_` token + cookies (25-min cache) | Simplified token (`wu.json`), low stability |
+| Upstream risk control     | Rarely blocked                               | Intermittently blocked (mitigated by retry) |
+| Video URL / large files   | ✅ Supported (needs yt-dlp)                  | ❌ Not supported (serverless limits)        |
+| Use case                  | Self-hosted, daily use                       | Quick deploy, light testing                 |
 
 ## Public Services
 
 Two public services are available for testing:
 
-| Service URL | Platform |
-|-------------|----------|
-| `https://qwen2api-n.smanx.xx.kg` | Netlify |
+| Service URL                          | Platform                                           |
+| ------------------------------------ | -------------------------------------------------- |
+| `https://qwen2api-n.smanx.xx.kg`     | Netlify                                            |
 | ~~`https://qwen2api-v.smanx.xx.kg`~~ | ~~Vercel~~ (Usage limit exceeded, service stopped) |
 
 - No API Token required (leave key empty)
@@ -148,13 +148,14 @@ The proxy also accepts legacy message-level `files` / `attachments` arrays for c
 
 ## Environment Variables
 
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `API_TOKENS` | API keys, multiple keys separated by commas | No |
-| `CHAT_DETAIL_LOG` | Enable detailed chat/upload logs (`true/1/on/yes` to enable, default off) | No |
-| `JSON_BODY_LIMIT` | Express JSON body size limit (default `20mb`, only for local/Docker Express runtime) | No |
-| `CHROME_PATH` | Path to the Chromium/Chrome executable. Auto-detected from common locations (Windows/macOS/Linux) or `PATH`; usually not needed | No |
-| `USE_CHROME_BAXIA` | Set to `false` to disable Chromium-based real token acquisition and fall back to the simplified token (for serverless or browser-less environments) | No |
+| Variable           | Description                                                                                                                                                                                             | Required            |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- |
+| `API_TOKENS`       | API keys, multiple keys separated by commas                                                                                                                                                             | No                  |
+| `QWEN_COOKIE`      | Logged-in `chat.qwen.ai` session cookie. **Required for `/v1/videos/generations` (t2v)** — the upstream gates text-to-video behind an authenticated account. Sent only to `chat.qwen.ai`, never logged. | No (only for video) |
+| `CHAT_DETAIL_LOG`  | Enable detailed chat/upload logs (`true/1/on/yes` to enable, default off)                                                                                                                               | No                  |
+| `JSON_BODY_LIMIT`  | Express JSON body size limit (default `20mb`, only for local/Docker Express runtime)                                                                                                                    | No                  |
+| `CHROME_PATH`      | Path to the Chromium/Chrome executable. Auto-detected from common locations (Windows/macOS/Linux) or `PATH`; usually not needed                                                                         | No                  |
+| `USE_CHROME_BAXIA` | Set to `false` to disable Chromium-based real token acquisition and fall back to the simplified token (for serverless/browser-less environments)                                                        | No                  |
 
 > **Note:** Web search is now enabled by default for all models. The `ENABLE_SEARCH` variable has been deprecated.
 
@@ -162,13 +163,14 @@ The proxy also accepts legacy message-level `files` / `attachments` arrays for c
 
 ### API Endpoints
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/v1/models` | GET | Get model list |
-| `/v1/chat/completions` | POST | Chat completion |
-| `/v1/images/generations` | POST | Image generation |
-| `/chat` | GET | Built-in web chat UI |
-| `/` | GET | Health check |
+| Endpoint                 | Method | Description                        |
+| ------------------------ | ------ | ---------------------------------- |
+| `/v1/models`             | GET    | Get model list                     |
+| `/v1/chat/completions`   | POST   | Chat completion                    |
+| `/v1/images/generations` | POST   | Image generation                   |
+| `/v1/videos/generations` | POST   | **Text-to-video (t2v) generation** |
+| `/chat`                  | GET    | Built-in web chat UI               |
+| `/`                      | GET    | Health check                       |
 
 ### Web Chat UI
 
@@ -210,7 +212,7 @@ curl https://your-domain/v1/images/generations \
 # Image generation (OpenAI size format)
 curl https://your-domain/v1/images/generations \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer your_token" \
+  -H "Authorization: Bearer ***" \
   -d '{
     "model": "qwen3.8-max",
     "prompt": "A beautiful landscape",
@@ -218,23 +220,47 @@ curl https://your-domain/v1/images/generations \
     "size": "1024x1024",
     "response_format": "b64_json"
   }'
+
+# Text-to-video (t2v) generation
+curl https://your-domain/v1/videos/generations \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ***" \
+  -d '{
+    "model": "qwen3.8-max",
+    "prompt": "A cat playing piano in a sunny room",
+    "size": "16:9",
+    "response_format": "url"
+  }'
+# -> { "created": 1786310234, "data": [ { "url": "https://cdn.qwenlm.ai/output/.../t2v/...mp4" } ] }
 ```
+
+> **t2v requires an authenticated Qwen session.** Unlike image generation, the
+> upstream gates text-to-video behind a logged-in account. A guest request
+> returns an empty answer with no task id. To generate video, forward your
+> logged-in Qwen cookie in one of two ways:
+>
+> - **Request body:** add `"qwen_cookie": "<your qwen.ai session cookie>"` to the JSON.
+> - **Environment variable:** set `QWEN_COOKIE` on the deployment (Node/Docker/Worker only).
+>
+> The cookie is sent only to `chat.qwen.ai` and is never logged. Treat it like a
+> password and keep the deployment private.
 
 ### Image Generation Parameter Reference
 
 #### Request Parameters
 
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `model` | string | No | Model name, default: `qwen3.8-max` |
-| `prompt` | string | Yes | Image description text |
-| `n` | number | No | Number of images to generate, default: 1, max: 10 |
-| `size` | string | No | Image size/ratio, default: `1:1` |
-| `response_format` | string | No | Response format: `url` (default) or `b64_json` |
+| Parameter         | Type   | Required | Description                                       |
+| ----------------- | ------ | -------- | ------------------------------------------------- |
+| `model`           | string | No       | Model name, default: `qwen3.8-max`                |
+| `prompt`          | string | Yes      | Image description text                            |
+| `n`               | number | No       | Number of images to generate, default: 1, max: 10 |
+| `size`            | string | No       | Image size/ratio, default: `1:1`                  |
+| `response_format` | string | No       | Response format: `url` (default) or `b64_json`    |
 
 #### Supported size parameter formats
 
 **Format 1: Ratio string (recommended)**
+
 - `1:1` - Square
 - `16:9` - Widescreen (landscape)
 - `9:16` - Portrait (vertical)
@@ -242,6 +268,7 @@ curl https://your-domain/v1/images/generations \
 - `3:4` - Traditional ratio (portrait)
 
 **Format 2: OpenAI compatible size format**
+
 - `1024x1024` - Automatically maps to closest ratio (1:1)
 - `1920x1080` - Automatically maps to closest ratio (16:9)
 - Any other width/height combination will automatically map to a supported ratio
@@ -249,6 +276,7 @@ curl https://your-domain/v1/images/generations \
 #### Response Formats
 
 **url format (default):**
+
 ```json
 {
   "created": 1234567890,
@@ -261,6 +289,7 @@ curl https://your-domain/v1/images/generations \
 ```
 
 **b64_json format:**
+
 ```json
 {
   "created": 1234567890,
@@ -293,21 +322,21 @@ for chunk in response:
 ```
 
 ```javascript
-import OpenAI from 'openai';
+import OpenAI from "openai";
 
 const client = new OpenAI({
-  apiKey: 'your_token',
-  baseURL: 'https://your-domain/v1'
+  apiKey: "your_token",
+  baseURL: "https://your-domain/v1",
 });
 
 const stream = await client.chat.completions.create({
-  model: 'qwen3.8-max',
-  messages: [{ role: 'user', content: 'Hello!' }],
-  stream: true
+  model: "qwen3.8-max",
+  messages: [{ role: "user", content: "Hello!" }],
+  stream: true,
 });
 
 for await (const chunk of stream) {
-  process.stdout.write(chunk.choices[0]?.delta?.content || '');
+  process.stdout.write(chunk.choices[0]?.delta?.content || "");
 }
 ```
 

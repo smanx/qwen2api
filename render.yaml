@@ -1,0 +1,39 @@
+# Render Blueprint for qwen2api
+# Deploy as a private Web Service. Text-to-video (t2v) requires QWEN_COOKIE.
+#
+# Quick start:
+#   1. Push this repo to a private GitHub repo (or fork it private).
+#   2. In Render: New -> Web Service -> connect the repo.
+#   3. Render auto-detects this file. Alternatively use "Manual" with the settings below.
+#   4. Set API_TOKENS (and QWEN_COOKIE if you need /v1/videos/generations).
+#
+# Render reads this blueprint on every deploy.
+
+services:
+  - type: web
+    name: qwen2api
+    runtime: node
+    plan: starter          # bump to standard/free as needed; free tier sleeps
+    region: oregon         # pick the region closest to chat.qwen.ai if you like
+    branch: main          # or feat/t2v-video-generation while testing
+    buildCommand: npm install
+    startCommand: node index.js
+    healthCheckPath: /
+    # Chromium-based baxia token acquisition is used automatically inside this
+    # Docker-free Node runtime; no extra system deps needed for token flow.
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "7860"
+      - key: API_TOKENS
+        sync: false          # set your comma-separated bearer tokens in Render dashboard
+      - key: QWEN_COOKIE
+        sync: false          # REQUIRED for /v1/videos/generations (t2v); logged-in qwen.ai cookie
+      - key: CHAT_DETAIL_LOG
+        value: "false"
+      - key: USE_CHROME_BAXIA
+        value: "true"        # use real Chromium token when available; falls back to wu.json
+
+# Note: Render free/starter web services may sleep after inactivity; the first
+# request after a sleep can be slow (cold start). For always-on, use a paid plan.

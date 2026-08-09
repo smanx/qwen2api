@@ -1251,6 +1251,228 @@ async function handleImageGenerations(body, authHeader, env) {
   }
 }
 
+// Extract the async taskId from an upstream t2v SSE payload.
+// The Qwen web client ends the stream with phase "async_task_complete" carrying
+// a taskId; we search the whole payload defensively (flat + nested).
+function extractAsyncTaskIdFromUpstreamSse(rawPayload) {
+  const payload = typeof rawPayload === 'string' ? rawPayload : '';
+  const candidates = [];
+  const walk = (node, depth) => {
+    if (!node || typeof node !== 'object' || depth > 6) return;
+    for (const key of Object.keys(node)) {
+      const lower = key.toLowerCase();
+      if (lower === 'taskid' && typeof node[key] === 'string' && node[key].length > 0) {
+        candidates.push(node[key]);
+      }
+      const v = node[key];
+      if (v && typeof v === 'object') walk(v, depth + 1);
+    }
+  };
+  for (const line of payload.split('\n')) {
+    const trimmed = line.trimStart();
+    if (!trimmed.startsWith('data:')) continue;
+    const data = trimmed.slice(5).trim();
+    if (!data || data === '[DONE]') continue;
+    try {
+      const parsed = JSON.parse(data);
+      if (parsed && typeof parsed.phase === 'string'
+        && /async_task/i.test(parsed.phase)
+        && typeof parsed.taskId === 'string' && parsed.taskId.length > 0) {
+        candidates.push(parsed.taskId);
+      }
+      walk(parsed, 0);
+    } catch {}
+  }
+  return candidates.length > 0 ? candidates[0] : null;
+}
+
+async function pollQwenTaskUntilDone(taskId, cookies, opts = {}) {
+  const intervalMs = Number.isFinite(opts.intervalMs) ? opts.intervalMs : 5000;
+  const maxAttempts = Number.isFinite(opts.maxAttempts) ? opts.maxAttempts : 60;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    let statusResp;
+    try {
+      statusResp = await fetch(`https://chat.qwen.ai/api/v2/task/status/${encodeURIComponent(taskId)}`, {
+        method: 'GET',
+        headers: {
+          'Accept': 'application/json',
+          'bx-ua': cookies.bxUa,
+          'bx-umidtoken': cookies.bxUmidToken,
+          'bx-v': cookies.bxV,
+          'Cookie': cookies.cookies || '',
+          'Origin': 'https://chat.qwen.ai',
+          'source': 'web',
+          'version': '0.2.83',
+          'Referer': 'https://chat.qwen.ai/c/guest',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
+          'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          'x-request-id': uuidv4(),
+        },
+      });
+    } catch (err) {
+      console.log(`[qwen2api][worker][video] task status request failed (attempt ${attempt + 1}): ${err && err.message ? err.message : String(err)}`);
+      await new Promise(r => setTimeout(r, intervalMs));
+      continue;
+    }
+    const parsed = await statusResp.json().catch(() => null);
+    const taskData = parsed && parsed.data ? parsed.data : (parsed || null);
+    const taskStatus = (taskData && taskData.task_status) || '';
+    console.log(`[qwen2api][worker][video] poll attempt ${attempt + 1}: status=${taskStatus}`);
+    if (taskStatus === 'success') {
+      const content = taskData && taskData.content;
+      let mediaUrl = typeof content === 'string' ? content.trim()
+        : (content && typeof content === 'object' ? (content.url || content.video_url || content.media_url || content.file_url || null) : null);
+      if (mediaUrl && typeof mediaUrl !== 'string') mediaUrl = null;
+      if (mediaUrl && /^https?:\/\//i.test(mediaUrl)) {
+        return { ok: true, url: mediaUrl, raw: taskData };
+      }
+      return { ok: false, error: 'Task succeeded but no media URL in content.', raw: taskData };
+    }
+    if (taskStatus === 'failed' || taskStatus === 'error') {
+      const detail = (taskData && (taskData.detail || taskData.error || taskData.message)) || 'Task failed';
+      return { ok: false, error: typeof detail === 'string' ? detail : JSON.stringify(detail), raw: taskData };
+    }
+    await new Promise(r => setTimeout(r, intervalMs));
+  }
+  return { ok: false, error: 'Timed out waiting for video generation task to complete.', raw: null };
+}
+
+async function handleVideoGenerations(body, authHeader, env) {
+  // OpenAI Videos API compatible: POST /v1/videos/generations
+  if (!validateToken(authHeader, env)) {
+    return jsonResponse({ error: { message: 'Incorrect API key provided.', type: 'invalid_request_error' } }, 401);
+  }
+
+  const prompt = normalizeInputString(body?.prompt);
+  if (!prompt) {
+    return jsonResponse({ error: { message: 'prompt is required', type: 'invalid_request_error' } }, 400);
+  }
+
+  const actualModel = normalizeInputString(body?.model) || 'qwen3.5-plus';
+  const responseFormat = normalizeInputString(body?.response_format) || 'url';
+  if (responseFormat !== 'url' && responseFormat !== 'b64_json') {
+    return jsonResponse({ error: { message: 'response_format must be one of url or b64_json', type: 'invalid_request_error' } }, 400);
+  }
+
+  const sizeHint = mapOpenAiImageSizeToQwenRatio(body?.size) || '16:9';
+  const durationRaw = body?.duration;
+  const duration = Number.isFinite(durationRaw) ? Number(durationRaw) : Number.parseInt(String(durationRaw || ''), 10);
+
+  // Allow forwarding a logged-in qwen session cookie so t2v (auth-gated) works.
+  const qwenCookie = (body?.qwen_cookie || (env && env.QWEN_COOKIE)) || '';
+  const usingAuth = !!qwenCookie.trim();
+
+  const { bxUa, bxUmidToken, bxV } = await getBaxiaTokens();
+  const cookies = { bxUa, bxUmidToken, bxV, cookies: qwenCookie };
+
+  const createResp = await fetch('https://chat.qwen.ai/api/v2/chats/new', {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+      'bx-ua': bxUa,
+      'bx-umidtoken': bxUmidToken,
+      'bx-v': bxV,
+      'Cookie': qwenCookie,
+      'Referer': 'https://chat.qwen.ai/c/guest',
+      'source': 'web',
+      'x-request-id': uuidv4(),
+    },
+    body: JSON.stringify({ title: '新建对话', models: [actualModel], chat_mode: usingAuth ? 'chat' : 'guest', chat_type: 't2v', timestamp: Date.now(), project_id: '' }),
+  });
+  const createData = await createResp.json().catch(() => ({}));
+  if (!createResp.ok || !createData?.success || !createData?.data?.id) {
+    return jsonResponse({ error: { message: 'Failed to create video chat session', type: 'api_error', details: createData } }, 500);
+  }
+  const chatId = createData.data.id;
+
+  const chatResp = await fetch(`https://chat.qwen.ai/api/v2/chat/completions?chat_id=${chatId}`, {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+      'bx-ua': bxUa,
+      'bx-umidtoken': bxUmidToken,
+      'bx-v': bxV,
+      'Cookie': qwenCookie,
+      'x-accel-buffering': 'no',
+      'source': 'web',
+      'version': '0.2.9',
+      'Referer': 'https://chat.qwen.ai/c/guest',
+      'x-request-id': uuidv4(),
+    },
+    body: JSON.stringify({
+      stream: true,
+      version: '2.1',
+      incremental_output: true,
+      chat_id: chatId,
+      chat_mode: usingAuth ? 'chat' : 'guest',
+      model: actualModel,
+      parent_id: null,
+      messages: [{
+        fid: uuidv4(), parentId: null, childrenIds: [uuidv4()], role: 'user', content: prompt,
+        user_action: 'chat', files: [], timestamp: Date.now(), models: [actualModel], model: '', chat_type: 't2v',
+        feature_config: { thinking_enabled: true, output_schema: 'phase', research_mode: 'normal', auto_thinking: true, thinking_mode: 'Auto', thinking_format: 'summary', auto_search: false, video_generation: true },
+        extra: { meta: { subChatType: 't2v' } }, sub_chat_type: 't2v', parent_id: null,
+      }],
+      timestamp: Date.now(),
+      size: sizeHint,
+      ...(Number.isFinite(duration) ? { duration } : {}),
+    }),
+  });
+
+  if (!chatResp.ok) {
+    return jsonResponse({ error: { message: await chatResp.text().catch(() => ''), type: 'api_error' } }, chatResp.status);
+  }
+
+  const reader = chatResp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+  }
+
+  const taskId = extractAsyncTaskIdFromUpstreamSse(buffer);
+  if (!taskId) {
+    console.log('[qwen2api][worker][video] Upstream SSE response with no async taskId:');
+    console.log(buffer.slice(0, 2000));
+    const hint = usingAuth
+      ? 'Upstream did not return a video generation task id (the session may be unauthorized for video).'
+      : 'Upstream did not return a video generation task id. t2v requires an authenticated qwen session — pass your logged-in cookie via the qwen_cookie field (or QWEN_COOKIE env).';
+    return jsonResponse({ error: { message: hint, type: 'api_error' } }, 502);
+  }
+
+  console.log(`[qwen2api][worker][video] got taskId=${taskId}, polling for completion...`);
+  const pollResult = await pollQwenTaskUntilDone(taskId, cookies, { intervalMs: 5000, maxAttempts: 60 });
+  if (!pollResult.ok) {
+    return jsonResponse({ error: { message: pollResult.error, type: 'api_error' } }, 502);
+  }
+
+  const created = Math.floor(Date.now() / 1000);
+  if (responseFormat === 'url') {
+    return jsonResponse({ created, data: [{ url: pollResult.url }] });
+  }
+
+  try {
+    const vidResp = await fetch(pollResult.url);
+    if (!vidResp.ok) throw new Error(`Failed to fetch video: HTTP ${vidResp.status}`);
+    const bytes = new Uint8Array(await vidResp.arrayBuffer());
+    let b64 = '';
+    let chunk = '';
+    for (let i = 0; i < bytes.length; i++) {
+      chunk += String.fromCharCode(bytes[i]);
+      if (chunk.length > 0x8000) { b64 += btoa(chunk); chunk = ''; }
+    }
+    if (chunk) b64 += btoa(chunk);
+    return jsonResponse({ created, data: [{ b64_json: b64 }] });
+  } catch (err) {
+    const message = err && err.message ? err.message : 'Failed to fetch video bytes';
+    return jsonResponse({ error: { message, type: 'api_error' } }, 502);
+  }
+}
+
 function tryParseOpenAiImageSize(size) {
   const text = normalizeInputString(size);
   if (!text) return null;
@@ -1414,6 +1636,15 @@ export default {
         return jsonResponse({ error: { message: 'Invalid JSON body.', type: 'invalid_request_error' } }, 400);
       }
       return handleImageGenerations(body, authHeader, env);
+    }
+    if (request.method === 'POST' && path === '/v1/videos/generations') {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return jsonResponse({ error: { message: 'Invalid JSON body.', type: 'invalid_request_error' } }, 400);
+      }
+      return handleVideoGenerations(body, authHeader, env);
     }
     if (request.method === 'GET' && (path === '/chat' || path === '/chat/')) {
       return handleChatPage();
