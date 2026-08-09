@@ -153,15 +153,16 @@ async function getBaxiaTokens(forceRefresh) {
 }
 
 // 创建会话，失败（风控/网络）时自动换 token 重试
-async function createChatSession(actualModel, chatType, retries = 3) {
+async function createChatSession(actualModel, chatType, retries = 3, cookiesOverride) {
   let lastErr = null;
   for (let attempt = 0; attempt <= retries; attempt++) {
     const { bxUa, bxUmidToken, bxV, cookies } = await getBaxiaTokens(attempt > 0);
+    const effectiveCookies = (typeof cookiesOverride === 'string' && cookiesOverride.trim()) ? cookiesOverride : cookies;
     try {
       const createHeaders = {
         'Accept': 'application/json', 'Content-Type': 'application/json',
         'bx-ua': bxUa, 'bx-umidtoken': bxUmidToken, 'bx-v': bxV,
-        'Cookie': cookies,
+        'Cookie': effectiveCookies,
         'Origin': QWEN_BASE_URL,
         'Referer': QWEN_GUEST_REFERER, 'source': 'web',
         'version': '0.2.83',
@@ -197,7 +198,7 @@ async function createChatSession(actualModel, chatType, retries = 3) {
         }
         return createResponse({ error: { message: createData?.data?.details || createData?.data?.message || createData?.data?.code || parsedErr?.message || 'Failed to create chat session', type: 'api_error', ...(parsedErr?.code ? { code: parsedErr.code } : {}) } }, 500);
       }
-      return { chatId: createData.data.id, bxUa, bxUmidToken, bxV, cookies };
+      return { chatId: createData.data.id, bxUa, bxUmidToken, bxV, cookies: effectiveCookies };
     } catch (err) {
       lastErr = { error: err, status: 0, resp: null };
       console.log(`[qwen2api][chat] Create chat session exception (attempt ${attempt + 1}): ${err && err.message ? err.message : String(err)}`);
@@ -706,7 +707,7 @@ async function pollQwenTaskUntilDone(taskId, { bxUa, bxUmidToken, bxV, cookies }
   return { ok: false, error: 'Timed out waiting for video generation task to complete.', raw: null };
 }
 
-async function handleVideoGenerations(body, authHeader, env) {
+async function handleVideoGenerations(body, authHeader, env, qwenCookie) {
   // OpenAI Videos API compatible: POST /v1/videos/generations
   // Request fields (best-effort subset): prompt (required), model, n, duration,
   //  size / resolution, response_format ("url" | "b64_json").
@@ -730,11 +731,12 @@ async function handleVideoGenerations(body, authHeader, env) {
   const duration = Number.isFinite(durationRaw) ? Number(durationRaw)
     : Number.parseInt(String(durationRaw || ''), 10);
 
-  const createdChat = await createChatSession(actualModel, 't2v');
+  const createdChat = await createChatSession(actualModel, 't2v', 3, qwenCookie);
   if (createdChat.statusCode) {
     return createdChat;
   }
   const { chatId, bxUa, bxUmidToken, bxV, cookies } = createdChat;
+  const usingAuth = !!(qwenCookie && qwenCookie.trim());
 
   const chatResp = await fetch(`${QWEN_BASE_URL}/api/v2/chat/completions?chat_id=${chatId}`, {
     method: 'POST',
@@ -807,7 +809,13 @@ async function handleVideoGenerations(body, authHeader, env) {
     }
     console.log('[qwen2api][video] Upstream SSE response with no async taskId:');
     console.log(rawText.slice(0, 2000));
-    return createResponse({ error: { message: 'Upstream did not return a video generation task id', type: 'api_error' } }, 502);
+    // Upstream gates t2v behind an authenticated session. A guest request
+    // returns an empty "answer" with no taskId. Hint the caller to forward
+    // their logged-in qwen session cookie via the x-qwen-cookie header.
+    const hint = usingAuth
+      ? 'Upstream did not return a video generation task id (the session may be unauthorized for video).'
+      : 'Upstream did not return a video generation task id. t2v requires an authenticated qwen session — forward your logged-in cookie via the "x-qwen-cookie" header.';
+    return createResponse({ error: { message: hint, type: 'api_error' } }, 502);
   }
 
   console.log(`[qwen2api][video] got taskId=${taskId}, polling for completion...`);

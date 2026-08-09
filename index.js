@@ -415,7 +415,7 @@ async function serverlessHandler(req, res) {
       if (res) return res.status(bad.statusCode).set(bad.headers).send(bad.body);
       return bad;
     }
-    const result = await handleVideoGenerations(body, authHeader);
+    const result = await handleVideoGenerations(body, authHeader, env, req.headers['x-qwen-cookie'] || req.headers['X-Qwen-Cookie']);
     if (res) return res.status(result.statusCode).set(result.headers).send(result.body);
     return result;
   }
@@ -549,7 +549,7 @@ function startExpressServer() {
 
   app.post('/v1/videos/generations', authMiddleware, async (req, res) => {
     logRequestPathBegin('express', req.path || '/v1/videos/generations');
-    const result = await handleVideoGenerations(req.body, req.headers.authorization);
+    const result = await handleVideoGenerations(req.body, req.headers.authorization, undefined, req.headers['x-qwen-cookie'] || req.headers['X-Qwen-Cookie']);
     res.status(result.statusCode).set(result.headers).send(result.body);
   });
 
