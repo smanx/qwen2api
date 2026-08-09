@@ -117,7 +117,7 @@ async function getBaxiaTokens(forceRefresh) {
       const { getBaxiaTokens: getChromeTokens } = require('./scripts/baxia-token.js');
       const t = await getChromeTokens();
       if (t && t.bxUmidToken && /^T2gA/i.test(t.bxUmidToken)) {
-        const result = { bxUa: t.bxUa, bxUmidToken: t.bxUmidToken, bxV: t.bxV || '2.5.37', cookies: t.cookies || '' };
+        const result = { bxUa: t.bxUa, bxUmidToken: t.bxUmidToken, bxV: t.bxV || '2.5.36', cookies: t.cookies || '' };
         tokenCache = result;
         tokenCacheTime = now;
         return result;
