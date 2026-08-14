@@ -23,5 +23,8 @@
   "devDependencies": {
     "cross-env": "^7.0.3",
     "nodemon": "^3.1.14"
+  },
+  "overrides": {
+    "path-to-regexp": "8.4.0"
   }
 }
