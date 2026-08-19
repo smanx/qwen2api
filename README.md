@@ -255,7 +255,13 @@ Three public services are available for testing:
 - ✅ The `/v1/chat/completions` endpoint now supports attachments and multimodal message parts, including image/file/audio inputs.
 - ✅ Supports image understanding and document parsing workflows in chat requests.
 - ⚠️ Attachments are uploaded to Qwen OSS through the same workflow used by Qwen Web, so request latency increases when sending large files.
-- ❌ **Tool calling is not supported** - The project does not implement OpenAI-style tool/function calling capabilities.
+- ✅ **Tool calling is supported** - `tools` and `tool_choice` on `/v1/chat/completions` return OpenAI-shaped `tool_calls` with `finish_reason: "tool_calls"`, in both streaming and non-streaming mode. Multi-turn loops work: send `assistant.tool_calls` and `role: "tool"` results back in `messages` and they are replayed to the model.
+  - Qwen Web has no native function-calling API, so calls are elicited by injecting Qwen's own `<tool_call>` prompt format and parsing them back out. Accuracy therefore depends on the model, unlike a native API.
+  - Markers inside ``` code fences or `inline code` are never executed, so the model can document the format without triggering a call.
+  - `tool_choice` accepts `auto` / `none` / `required` / a named function. `required` and named functions are prompt-level instructions: the model is told it must call, but a refusal is not rejected with an error.
+  - Tool names and arguments are not validated against your schemas - validate them in your own executor.
+  - Qwen Web runs its own tool layer that emits `Tool <name> does not exists.` when it cannot resolve your tool names. That prose is upstream noise and is stripped before it reaches you.
+  - Guest sessions have a daily usage limit. When it is reached the proxy returns HTTP 429 with `type: "rate_limit_error"` and the upstream message, so clients back off correctly.
 
 ### Limitations (Video URL / Large Files)
 

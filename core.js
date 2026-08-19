@@ -528,6 +528,427 @@ function mapUsageToOpenAI(usage) {
   return mapped;
 }
 
+// ============================================
+// 工具调用 (Tool Calling)
+// 上游 chat.qwen.ai 无原生 function calling：
+// 注入提示词让模型输出 Qwen 原生 Hermes 语法，再筛回 OpenAI tool_calls。
+// 语法只在这一节定义，流式与缓冲两条路径共用，避免漂移。
+// 注入的只有 Hermes 一种；XML <invoke> 形式仅在解析侧接受，作为模型漂移时的兜底。
+// ============================================
+
+const TOOL_MARKERS = [
+  { open: '<tool_call>', close: '</tool_call>', kind: 'json' },
+  { open: '<tool_calls>', close: '</tool_calls>', kind: 'xml' },
+];
+
+function normalizeToolChoice(toolChoice) {
+  if (toolChoice === 'none') return { mode: 'none' };
+  if (toolChoice === 'required') return { mode: 'required' };
+  if (toolChoice && typeof toolChoice === 'object') {
+    const name = normalizeInputString(toolChoice.function?.name || toolChoice.name);
+    if (name) return { mode: 'function', name };
+  }
+  return { mode: 'auto' };
+}
+
+function buildToolPrompt(tools, toolChoice) {
+  const list = Array.isArray(tools) ? tools.filter((tool) => tool && (tool.function || tool.name)) : [];
+  if (list.length === 0) return '';
+  const choice = normalizeToolChoice(toolChoice);
+  if (choice.mode === 'none') return '';
+  const signatures = list.map((tool) => JSON.stringify(tool.function || tool)).join('\n');
+  let mandate = '';
+  if (choice.mode === 'required') mandate = '\n\nYou MUST call at least one function in this turn.';
+  // 名称来自调用方，必须转义后再插入提示词
+  if (choice.mode === 'function') mandate = `\n\nYou MUST call the function ${JSON.stringify(choice.name)} in this turn.`;
+  return [
+    '# Tools',
+    '',
+    'You may call one or more functions to assist with the user query.',
+    '',
+    'You are provided with function signatures within <tools></tools> XML tags:',
+    '<tools>',
+    signatures,
+    '</tools>',
+    '',
+    'For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:',
+    '<tool_call>',
+    '{"name": <function-name>, "arguments": <args-json-object>}',
+    '</tool_call>',
+    '',
+    'Emit <tool_call> tags only outside code fences; a tag inside ``` or inline code is never executed.',
+  ].join('\n') + mandate;
+}
+
+function newToolCallId() {
+  return `call_${uuidv4().replace(/-/g, '').slice(0, 24)}`;
+}
+
+// arguments 必须是可 JSON.parse 的对象字符串，否则客户端会在解析时炸掉；
+// 无法规范化时返回 null，整块按“畸形”原样释放为文本。
+function normalizeToolArguments(args) {
+  let value = args;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return '{}';
+    try {
+      value = JSON.parse(trimmed);
+    } catch {
+      return null;
+    }
+  }
+  if (value === undefined || value === null) return '{}';
+  if (typeof value !== 'object' || Array.isArray(value)) return null;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return null;
+  }
+}
+
+function makeToolCall(name, args) {
+  const safeName = normalizeInputString(name);
+  if (!safeName) return null;
+  const serialized = normalizeToolArguments(args);
+  if (serialized === null) return null;
+  return { id: newToolCallId(), type: 'function', function: { name: safeName, arguments: serialized } };
+}
+
+function stripCdata(value) {
+  const matched = /^\s*<!\[CDATA\[([\s\S]*?)\]\]>\s*$/.exec(value);
+  return matched ? matched[1] : value;
+}
+
+function decodeXmlEntities(value) {
+  return value
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
+function coerceParameterValue(raw) {
+  const cdata = stripCdata(raw);
+  // CDATA 内是原样载荷，不做实体解码
+  const text = cdata === raw ? decodeXmlEntities(raw) : cdata;
+  const trimmed = text.trim();
+  if (!trimmed) return text;
+  if (/^(-?\d+(\.\d+)?([eE][+-]?\d+)?|true|false|null|\[[\s\S]*\]|\{[\s\S]*\})$/.test(trimmed)) {
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return trimmed;
+    }
+  }
+  return trimmed;
+}
+
+function parseJsonToolBlock(inner) {
+  let parsed;
+  try {
+    parsed = JSON.parse(inner);
+  } catch {
+    return [];
+  }
+  const items = Array.isArray(parsed) ? parsed : [parsed];
+  const calls = [];
+  for (const item of items) {
+    if (!item || typeof item !== 'object') return [];
+    const call = makeToolCall(
+      item.name || item.function?.name,
+      item.arguments ?? item.parameters ?? item.function?.arguments,
+    );
+    if (!call) return [];
+    calls.push(call);
+  }
+  return calls;
+}
+
+function parseXmlToolBlock(inner) {
+  const calls = [];
+  const invokeRe = /<invoke\s+name\s*=\s*["']([^"']+)["']\s*>([\s\S]*?)<\/invoke>/g;
+  let invoke;
+  while ((invoke = invokeRe.exec(inner)) !== null) {
+    // null 原型：参数名由模型产出，不能让 __proto__ 之类污染原型
+    const args = Object.create(null);
+    const paramRe = /<parameter\s+name\s*=\s*["']([^"']+)["']\s*>([\s\S]*?)<\/parameter>/g;
+    let param;
+    while ((param = paramRe.exec(invoke[2])) !== null) {
+      if (param[1] === '__proto__' || param[1] === 'constructor' || param[1] === 'prototype') continue;
+      args[param[1]] = coerceParameterValue(param[2]);
+    }
+    const call = makeToolCall(invoke[1], args);
+    if (!call) return [];
+    calls.push(call);
+  }
+  return calls;
+}
+
+function parseToolCallBlock(raw, marker) {
+  const inner = raw.slice(marker.open.length, raw.length - marker.close.length);
+  return marker.kind === 'json' ? parseJsonToolBlock(inner.trim()) : parseXmlToolBlock(inner);
+}
+
+// Qwen Web 自带工具层会尝试在它自己的注册表里解析我们的工具名，失败后把
+// "Tool xxx does not exists." 塞进输出流。这不是模型的回答，是上游噪声。
+const TOOL_NOISE_RE = /^Tool\s+\S+\s+does not exists?\.[ \t]*\n?/i;
+const TOOL_NOISE_MAX = 96;
+
+function matchToolNoise(rest, final) {
+  const matched = TOOL_NOISE_RE.exec(rest);
+  if (matched) {
+    // 匹配正好吃到 rest 末尾时，后面可能还有属于噪声的空白/换行。
+    // 不等到能区分就消费，切块位置不同会得出不同结果。
+    if (!final && matched[0].length === rest.length) return 'partial';
+    return matched[0].length;
+  }
+  // 还可能随后续文本长成一次完整匹配吗？
+  if (!final && rest.length < TOOL_NOISE_MAX && /^T(o(o(l(\s[\s\S]*)?)?)?)?$/i.test(rest)) return 'partial';
+  return null;
+}
+
+function matchToolMarker(rest) {
+  for (const marker of TOOL_MARKERS) {
+    if (rest.startsWith(marker.open)) return marker;
+  }
+  for (const marker of TOOL_MARKERS) {
+    if (marker.open.startsWith(rest)) return 'partial';
+  }
+  return null;
+}
+
+// 增量筛选器：普通文本实时放行；只有可能是标记前缀的尾巴才回退缓冲。
+// 解析失败的块原样作为文本释放，绝不静默吞掉。
+const MAX_TOOL_CAPTURE_BYTES = 256 * 1024;
+const MAX_LINE_SCAN_BYTES = 4096;
+
+function createToolCallSieve() {
+  let pending = '';
+  let curLine = '';
+  let fence = null;
+  let inInline = false;
+  let capture = null;
+  const calls = [];
+
+  function applyLineState(line) {
+    inInline = false;
+    const text = line.replace(/\r?\n$/, '');
+    const opener = /^ {0,3}(`{3,}|~{3,})/.exec(text);
+    if (!opener) return;
+    const char = opener[1][0];
+    const len = opener[1].length;
+    if (fence) {
+      if (char === fence.char && len >= fence.len && /^\s*$/.test(text.slice(opener[0].length))) fence = null;
+    } else {
+      fence = { char, len };
+    }
+  }
+
+  function drain(final) {
+    let out = '';
+    for (;;) {
+      if (capture) {
+        const idx = pending.indexOf(capture.marker.close);
+        if (idx === -1) {
+          // 开标记始终不闭合时，超过上限就整块当文本放行，避免无限缓冲和静默卡流
+          if (!final && capture.raw.length + pending.length <= MAX_TOOL_CAPTURE_BYTES) return out;
+          out += capture.raw + pending;
+          pending = '';
+          capture = null;
+          if (!final) continue;
+          return out;
+        }
+        const raw = capture.raw + pending.slice(0, idx + capture.marker.close.length);
+        pending = pending.slice(idx + capture.marker.close.length);
+        const parsed = parseToolCallBlock(raw, capture.marker);
+        capture = null;
+        curLine = '';
+        inInline = false;
+        if (parsed.length > 0) {
+          for (const call of parsed) calls.push(call);
+        } else {
+          out += raw;
+        }
+        continue;
+      }
+
+      let i = 0;
+      // 消费掉标记或噪声后置位：跳出内层扫描，让外层循环用更新后的 pending 重来
+      let restart = false;
+      while (i < pending.length) {
+        const ch = pending[i];
+        if (ch === '\n') {
+          if (curLine.length < MAX_LINE_SCAN_BYTES) curLine += ch;
+          applyLineState(curLine);
+          curLine = '';
+          i += 1;
+          continue;
+        }
+        if (!fence && ch === '`') {
+          inInline = !inInline;
+          if (curLine.length < MAX_LINE_SCAN_BYTES) curLine += ch;
+          i += 1;
+          continue;
+        }
+        if (!fence && !inInline && (ch === 'T' || ch === 't')) {
+          const noise = matchToolNoise(pending.slice(i), final);
+          if (noise === 'partial') {
+            if (!final) {
+              out += pending.slice(0, i);
+              pending = pending.slice(i);
+              return out;
+            }
+          } else if (noise) {
+            out += pending.slice(0, i);
+            pending = pending.slice(i + noise);
+            restart = true;
+            break;
+          }
+        }
+        if (!fence && !inInline && ch === '<') {
+          const matched = matchToolMarker(pending.slice(i));
+          if (matched === 'partial') {
+            if (!final) {
+              out += pending.slice(0, i);
+              pending = pending.slice(i);
+              return out;
+            }
+          } else if (matched) {
+            out += pending.slice(0, i);
+            capture = { marker: matched, raw: matched.open };
+            pending = pending.slice(i + matched.open.length);
+            restart = true;
+            break;
+          }
+        }
+        if (curLine.length < MAX_LINE_SCAN_BYTES) curLine += ch;
+        i += 1;
+      }
+      if (restart) continue;
+      out += pending;
+      pending = '';
+      return out;
+    }
+  }
+
+  return {
+    push(text) {
+      if (typeof text !== 'string' || !text) return '';
+      pending += text;
+      return drain(false);
+    },
+    flush() {
+      const content = drain(true);
+      // 未闭合的代码围栏会压制其后所有标记；报出来才能诊断“整轮工具调用消失”
+      return { content, tool_calls: calls.slice(), unterminatedFence: !!fence };
+    },
+  };
+}
+
+function extractToolCalls(text) {
+  const sieve = createToolCallSieve();
+  const head = sieve.push(typeof text === 'string' ? text : '');
+  const tail = sieve.flush();
+  return { content: head + tail.content, tool_calls: tail.tool_calls };
+}
+
+// 筛子捕获大块工具调用期间不会向客户端写入任何字节，中间的代理和负载均衡器
+// 常按空闲超时掐断连接。默认 15s 发一个 SSE 注释保活；不同部署的超时不同，
+// 所以留出 SSE_KEEPALIVE_MS 调节（0 表示每次都发，便于测试）。
+function getSieveKeepaliveMs() {
+  const raw = (typeof process !== 'undefined' && process.env && process.env.SSE_KEEPALIVE_MS) || '';
+  const parsed = Number(raw);
+  return raw !== '' && Number.isFinite(parsed) && parsed >= 0 ? parsed : 15000;
+}
+
+// 把上游 delta 的 content 过一遍筛子；整块被吞时返回 null 以跳过该 chunk
+function sieveDelta(sieve, delta) {
+  if (!sieve || !delta || typeof delta.content !== 'string') return delta;
+  const emitted = sieve.push(delta.content);
+  const rest = { ...delta };
+  delete rest.content;
+  if (emitted) return { ...rest, content: emitted };
+  const keys = Object.keys(rest);
+  // 只剩 role 的 chunk 没有任何信息量：上游每个 delta 都带 role，捕获期间会刷出
+  // 几十个空 chunk。丢掉它们，让连接真正空闲下来，由保活注释来兜。
+  if (keys.length === 0 || (keys.length === 1 && rest.role)) return null;
+  return rest;
+}
+
+// 流末尾：释放筛子里剩下的文本 + tool_calls + finish_reason
+function writeSieveFinale(write, sieve, responseId, created, model, options = {}) {
+  const flushed = sieve.flush();
+  const hasCalls = flushed.tool_calls.length > 0;
+  let roleSent = !!options.roleSent;
+  const emit = (delta, finishReason) => {
+    // 纯工具调用时前面可能一个 chunk 都没发过，role 必须由这里补上
+    const payload = roleSent ? delta : { role: 'assistant', ...delta };
+    roleSent = true;
+    write(`data: ${JSON.stringify({
+      id: responseId,
+      object: 'chat.completion.chunk',
+      created,
+      model,
+      choices: [{ index: 0, delta: payload, finish_reason: finishReason }],
+    })}\n\n`);
+  };
+  if (flushed.content) emit({ content: flushed.content }, null);
+  if (hasCalls) {
+    emit({ tool_calls: flushed.tool_calls.map((call, index) => ({ index, ...call })) }, null);
+  }
+  if (!options.suppressFinal) {
+    // 只有真的解析出调用才改写终止原因；否则透传上游的 length / content_filter
+    emit({}, hasCalls ? 'tool_calls' : (options.upstreamFinish || 'stop'));
+  }
+  logChatDetail('core', 'toolcall.extracted', { count: flushed.tool_calls.length, stream: true });
+  if (flushed.unterminatedFence && !hasCalls) {
+    logChatDetail('core', 'toolcall.fence.unterminated', { contentLength: flushed.content.length });
+  }
+  return flushed;
+}
+
+// 非流式 / 重打包流式的统一出口
+function buildToolAwareResponse({ stream, responseId, created, model, content, toolCalls, reasoningContent, usage, upstreamFinish }) {
+  const calls = Array.isArray(toolCalls) ? toolCalls : [];
+  const finishReason = calls.length > 0 ? 'tool_calls' : (upstreamFinish || 'stop');
+  if (stream) {
+    const events = [];
+    let roleSent = false;
+    const push = (delta, reason) => {
+      events.push({ delta: roleSent ? delta : { role: 'assistant', ...delta }, finish_reason: reason });
+      roleSent = true;
+    };
+    // 无工具时这条路径不会走到，但有工具时 reasoning 同样不能丢
+    if (reasoningContent) push({ reasoning_content: reasoningContent }, null);
+    if (content) push({ content }, null);
+    if (calls.length > 0) {
+      push({ tool_calls: calls.map((call, index) => ({ index, ...call })) }, null);
+    }
+    events.push({ delta: {}, finish_reason: finishReason });
+    const body = events.map((event) => `data: ${JSON.stringify({
+      id: responseId,
+      object: 'chat.completion.chunk',
+      created,
+      model,
+      choices: [{ index: 0, delta: event.delta, finish_reason: event.finish_reason }],
+    })}\n\n`).join('') + 'data: [DONE]\n\n';
+    return createStreamResponse(body);
+  }
+  const message = { role: 'assistant', content: calls.length > 0 && !content ? null : content };
+  if (reasoningContent) message.reasoning_content = reasoningContent;
+  if (calls.length > 0) message.tool_calls = calls;
+  return createResponse({
+    id: responseId,
+    object: 'chat.completion',
+    created,
+    model,
+    choices: [{ index: 0, message, finish_reason: finishReason }],
+    usage: mapUsageToOpenAI(usage),
+  });
+}
+
 function tryParseOpenAiImageSize(size) {
   const text = normalizeInputString(size);
   if (!text) return null;
@@ -848,6 +1269,42 @@ function normalizeLegacyFiles(message) {
   return attachments;
 }
 
+// 历史文本是不可信输入（尤其工具结果）：中和标记，否则模型照抄后会被筛子当成真调用
+function neutralizeToolMarkers(text) {
+  if (typeof text !== 'string' || !text) return '';
+  return text.replace(/<(\/?)(tool_calls?|invoke|parameter)\b/gi, '&lt;$1$2');
+}
+
+function renderToolCallBlocks(toolCalls) {
+  const blocks = [];
+  for (const toolCall of Array.isArray(toolCalls) ? toolCalls : []) {
+    const fn = toolCall?.function || {};
+    const name = normalizeInputString(fn.name);
+    if (!name) continue; // 无名调用只会教模型产出空名
+    const args = normalizeToolArguments(fn.arguments) || '{}';
+    const id = normalizeInputString(toolCall?.id);
+    // 带上 id：并行调用时模型才能把结果对回具体那一次
+    const idPart = id ? `, "id": ${JSON.stringify(id)}` : '';
+    blocks.push(`<tool_call>\n{"name": ${JSON.stringify(name)}, "arguments": ${args}${idPart}}\n</tool_call>`);
+  }
+  return blocks;
+}
+
+function renderHistoryMessage(m) {
+  if (m.role === 'tool' || m.role === 'function') {
+    const label = [m.name, m.toolCallId].filter(Boolean).join(' #');
+    return `[Tool Result]${label ? ` (${label})` : ''}: ${neutralizeToolMarkers(m.text)}`;
+  }
+  const blocks = [];
+  if (m.text) blocks.push(neutralizeToolMarkers(m.text));
+  if (m.role === 'assistant') blocks.push(...renderToolCallBlocks(m.toolCalls));
+  if (blocks.length === 0) return '';
+  const role = m.role === 'assistant'
+    ? 'Assistant'
+    : (m.role === 'system' || m.role === 'developer') ? 'System' : 'User';
+  return `[${role}]: ${blocks.join('\n')}`;
+}
+
 function parseIncomingMessages(messages) {
   const safeMessages = Array.isArray(messages) ? messages : [];
   const normalized = safeMessages.map(message => {
@@ -856,6 +1313,9 @@ function parseIncomingMessages(messages) {
       role: message?.role || 'user',
       text: parsed.text,
       attachments: [...parsed.attachments, ...normalizeLegacyFiles(message)],
+      toolCalls: Array.isArray(message?.tool_calls) ? message.tool_calls : [],
+      toolCallId: normalizeInputString(message?.tool_call_id),
+      name: normalizeInputString(message?.name),
     };
   });
 
@@ -865,22 +1325,30 @@ function parseIncomingMessages(messages) {
 
   const last = normalized[normalized.length - 1];
   const history = normalized.slice(0, -1)
-    .map(m => {
-      if (!m.text) return '';
-      const role = m.role === 'assistant' ? 'Assistant' : m.role === 'system' ? 'System' : 'User';
-      return `[${role}]: ${m.text}`;
-    })
+    .map(renderHistoryMessage)
     .filter(Boolean)
     .join('\n\n');
 
-  const lastText = last.text || (last.attachments.length > 0 ? '请结合附件内容回答。' : '');
-  const merged = history
-    ? `${history}\n\n[User]: ${lastText}`
-    : lastText;
+  // 工具消息（assistant.tool_calls / role:"tool"）要按角色回写，否则智能体回路无法闭合
+  const lastIsToolTurn = last.role === 'tool' || last.role === 'function' || last.toolCalls.length > 0;
+  let merged;
+  if (lastIsToolTurn) {
+    let rendered = renderHistoryMessage(last);
+    // 工具轮同样可能只带附件而无文本
+    if (!last.text && last.attachments.length > 0) rendered += '\n请结合附件内容回答。';
+    merged = history ? `${history}\n\n${rendered}` : rendered;
+  } else {
+    const lastText = last.text || (last.attachments.length > 0 ? '请结合附件内容回答。' : '');
+    merged = history
+      ? `${history}\n\n[User]: ${lastText}`
+      : lastText;
+  }
 
   return {
     content: merged,
     attachments: last.attachments,
+    // 即便本次请求没带 tools，历史里的调用记录也会诱导模型继续输出标记
+    hasToolHistory: normalized.some((m) => m.role === 'tool' || m.role === 'function' || m.toolCalls.length > 0),
   };
 }
 
@@ -1510,7 +1978,7 @@ async function handleChatCompletions(body, authHeader, env, streamWriter) {
     return createResponse({ error: { message: 'Incorrect API key provided.', type: 'invalid_request_error' } }, 401);
   }
 
-  const { model, messages, stream = false, tools } = body;
+  const { model, messages, stream = false, tools, tool_choice: toolChoice } = body;
   if (!messages?.length) {
     logChatDetail('core', 'request.validation.failed', { reason: 'Messages are required' });
     return createResponse({ error: { message: 'Messages are required', type: 'invalid_request_error' } }, 400);
@@ -1539,7 +2007,10 @@ async function handleChatCompletions(body, authHeader, env, streamWriter) {
 
   // 解析 OpenAI 兼容消息与附件
   const parsedMessages = parseIncomingMessages(messages);
-  const content = parsedMessages.content;
+  const toolPrompt = buildToolPrompt(tools, toolChoice);
+  // Qwen 原生模板把 # Tools 放在系统位；展平后最接近的位置是最前面
+  const content = toolPrompt ? `${toolPrompt}\n\n${parsedMessages.content}` : parsedMessages.content;
+  const needsSieve = !!toolPrompt || !!parsedMessages.hasToolHistory;
   logChatDetail('core', 'message.parsed', {
     contentLength: content.length,
     attachmentCount: parsedMessages.attachments.length,
@@ -1593,7 +2064,7 @@ async function handleChatCompletions(body, authHeader, env, streamWriter) {
   // 如果有流写入器 (Express)，使用真正的流式
   if (streamWriter && stream) {
     logChatDetail('core', 'stream.proxy.express', { chatId, model: actualModel });
-    return streamWriter(chatResp, actualModel, responseId, created);
+    return streamWriter(chatResp, actualModel, responseId, created, needsSieve ? createToolCallSieve() : null);
   }
 
   // 默认：收集完整响应
@@ -1619,6 +2090,17 @@ async function handleChatCompletions(body, authHeader, env, streamWriter) {
   logChatDetail('core', 'stream.content.full', {
     content: parsedSse.content,
   });
+
+  if (needsSieve) {
+    const sieved = extractToolCalls(parsedSse.content);
+    logChatDetail('core', 'toolcall.extracted', { count: sieved.tool_calls.length, stream: !!stream });
+    return buildToolAwareResponse({
+      stream, responseId, created, model: actualModel,
+      content: sieved.content, toolCalls: sieved.tool_calls,
+      reasoningContent: parsedSse.reasoning_content, usage: parsedSse.usage,
+      upstreamFinish: parsedSse.events.reduce((acc, e) => e.finish_reason || acc, null),
+    });
+  }
 
   if (stream) {
     logChatDetail('core', 'stream.repack.start', { chunkCount: parsedSse.events.length });
@@ -1978,13 +2460,17 @@ async function downloadVideoWithYtDlp(videoUrl, sendLog, preferredResolution) {
 
 function createLogStreamWriter(writer, onDone = null) {
   // writer 是一个对象，包含 write/log/end 方法
-  return async (response, model, responseId, created, logStream) => {
+  return async (response, model, responseId, created, sieve = null) => {
     const reader = response.body?.getReader ? response.body.getReader() : null;
     const decoder = new TextDecoder();
     let buffer = '';
     let doneWritten = false;
     let anyChunkWritten = false;
     let nonDataBuffer = '';
+    let upstreamFinish = null;
+    let roleSent = false;
+    let errorWritten = false;
+    let lastWriteAt = Date.now();
 
     if (!reader) {
       throw new Error('Upstream response has no readable body');
@@ -2007,8 +2493,11 @@ function createLogStreamWriter(writer, onDone = null) {
           }
           const data = trimmed.slice(5).trim();
           if (data === '[DONE]') {
-            writer.write('data: [DONE]\n\n');
-            doneWritten = true;
+            // 有筛子时把 [DONE] 推迟到 finale 之后，否则 tool_calls 会排在 [DONE] 后面
+            if (!sieve) {
+              writer.write('data: [DONE]\n\n');
+              doneWritten = true;
+            }
             continue;
           }
 
@@ -2030,6 +2519,8 @@ function createLogStreamWriter(writer, onDone = null) {
                     finish_reason: 'stop',
                   }],
                 };
+                // 先放出筛子里已解析的内容/调用，再报安全警告
+                if (sieve) writeSieveFinale((data) => writer.write(data), sieve, responseId, created, model, { roleSent, suppressFinal: true });
                 writer.write(`data: ${JSON.stringify(warningChunk)}\n\n`);
                 doneWritten = true;
                 writer.write('data: [DONE]\n\n');
@@ -2042,13 +2533,19 @@ function createLogStreamWriter(writer, onDone = null) {
                   code: upstreamError.code,
                 }
               };
+              if (sieve) writeSieveFinale((data) => writer.write(data), sieve, responseId, created, model, { roleSent, suppressFinal: true });
               writer.write(`data: ${JSON.stringify(errObj)}\n\n`);
               anyChunkWritten = true;
+              errorWritten = true;
               continue;
             }
 
-            const delta = mapUpstreamDeltaToOpenAI(parsed?.choices?.[0]?.delta);
-            if (delta || parsed?.choices?.[0]?.finish_reason) {
+            const delta = sieveDelta(sieve, mapUpstreamDeltaToOpenAI(parsed?.choices?.[0]?.delta));
+            if (parsed?.choices?.[0]?.finish_reason) upstreamFinish = parsed.choices[0].finish_reason;
+            // 筛子接管终止语义：finish_reason 由 finale 发出，上游原因经 upstreamFinish 透传
+            const finishReason = sieve ? null : (parsed?.choices?.[0]?.finish_reason || null);
+            if (delta || finishReason) {
+              if (delta && delta.role === 'assistant') roleSent = true;
               const chunk = {
                 id: responseId,
                 object: 'chat.completion.chunk',
@@ -2057,11 +2554,15 @@ function createLogStreamWriter(writer, onDone = null) {
                 choices: [{
                   index: 0,
                   delta: delta || {},
-                  finish_reason: parsed?.choices?.[0]?.finish_reason || null,
+                  finish_reason: finishReason,
                 }],
               };
               writer.write(`data: ${JSON.stringify(chunk)}\n\n`);
+              lastWriteAt = Date.now();
               anyChunkWritten = true;
+            } else if (sieve && Date.now() - lastWriteAt >= getSieveKeepaliveMs()) {
+              writer.write(': keepalive\n\n');
+              lastWriteAt = Date.now();
             }
           } catch {}
         }
@@ -2069,16 +2570,28 @@ function createLogStreamWriter(writer, onDone = null) {
       if (buffer.trim() && !buffer.trimStart().startsWith('data:')) {
         nonDataBuffer += buffer;
       }
+      // 顺序要紧：先判上游的纯错误体，否则 finale 会把它盖成一次空的成功响应
       if (!doneWritten && !anyChunkWritten) {
         const err = tryParseUpstreamErrorPayload(nonDataBuffer);
         if (err) {
           writer.write(`data: ${JSON.stringify({ error: err })}\n\n`);
           writer.write('data: [DONE]\n\n');
           doneWritten = true;
+          errorWritten = true;
         }
+      }
+      if (sieve && !doneWritten && !errorWritten) {
+        writeSieveFinale((data) => writer.write(data), sieve, responseId, created, model, { roleSent, upstreamFinish });
+        anyChunkWritten = true;
       }
     } catch (err) {
       const message = err && err.message ? err.message : 'stream proxy error';
+      // 中断前先释放筛子，否则已解析的内容和调用会静默丢失
+      if (sieve && !doneWritten) {
+        try {
+          writeSieveFinale((data) => writer.write(data), sieve, responseId, created, model, { roleSent, suppressFinal: true });
+        } catch {}
+      }
       writer.write(`data: ${JSON.stringify({ error: { message, type: 'api_error' } })}\n\n`);
     } finally {
       if (!doneWritten) {
@@ -2108,7 +2621,7 @@ async function handleChatCompletionsWithLogs(body, authHeader, env, streamWriter
     return createResponse({ error: { message: 'Incorrect API key provided.', type: 'invalid_request_error' } }, 401);
   }
 
-  const { model, messages, stream = false, tools } = body;
+  const { model, messages, stream = false, tools, tool_choice: toolChoice } = body;
   if (!messages?.length) {
     logChatDetail('core', 'request.validation.failed', { reason: 'Messages are required' });
     return createResponse({ error: { message: 'Messages are required', type: 'invalid_request_error' } }, 400);
@@ -2150,7 +2663,10 @@ async function handleChatCompletionsWithLogs(body, authHeader, env, streamWriter
 
   // 解析消息与附件
   const parsedMessages = parseIncomingMessages(messages);
-  const content = parsedMessages.content;
+  const toolPrompt = buildToolPrompt(tools, toolChoice);
+  // Qwen 原生模板把 # Tools 放在系统位；展平后最接近的位置是最前面
+  const content = toolPrompt ? `${toolPrompt}\n\n${parsedMessages.content}` : parsedMessages.content;
+  const needsSieve = !!toolPrompt || !!parsedMessages.hasToolHistory;
   logChatDetail('core', 'message.parsed', {
     contentLength: content.length,
     attachmentCount: parsedMessages.attachments.length,
@@ -2294,7 +2810,7 @@ async function handleChatCompletionsWithLogs(body, authHeader, env, streamWriter
   if (streamWriter && stream) {
     logChatDetail('core', 'stream.proxy.express', { chatId, model: actualModel });
     const logAwareWriter = createLogStreamWriter(streamWriter, cleanupTempFiles);
-    return logAwareWriter(chatResp, actualModel, responseId, created);
+    return logAwareWriter(chatResp, actualModel, responseId, created, needsSieve ? createToolCallSieve() : null);
   }
 
   // 非 Express 环境：收集完整响应
@@ -2327,6 +2843,17 @@ async function handleChatCompletionsWithLogs(body, authHeader, env, streamWriter
   // 清理临时视频文件
   cleanupTempFiles();
 
+  if (needsSieve) {
+    const sieved = extractToolCalls(parsedSse.content);
+    logChatDetail('core', 'toolcall.extracted', { count: sieved.tool_calls.length, stream: !!stream });
+    return buildToolAwareResponse({
+      stream, responseId, created, model: actualModel,
+      content: sieved.content, toolCalls: sieved.tool_calls,
+      reasoningContent: parsedSse.reasoning_content, usage: parsedSse.usage,
+      upstreamFinish: parsedSse.events.reduce((acc, e) => e.finish_reason || acc, null),
+    });
+  }
+
   if (stream) {
     logChatDetail('core', 'stream.repack.start', { chunkCount: parsedSse.events.length });
     const streamBody = parsedSse.events.map((event) => `data: ${JSON.stringify({
@@ -2351,7 +2878,7 @@ async function handleChatCompletionsWithLogs(body, authHeader, env, streamWriter
 // 通用 SSE 流写入器：把上游 SSE 实时转成 OpenAI 格式并写入 res
 // （res 只需支持 setHeader / write / end / writableEnded，Express 与 Vercel Node 均满足）
 function createExpressStreamHandler(res) {
-  return async (response, model, responseId, created) => {
+  return async (response, model, responseId, created, sieve = null) => {
     const rawFlag = (typeof process !== 'undefined' && process.env && process.env.CHAT_DETAIL_LOG) || '';
     const debugEnabled = ['1', 'true', 'yes', 'on'].includes(String(rawFlag).toLowerCase());
     let hasStreamContent = false;
@@ -2375,6 +2902,10 @@ function createExpressStreamHandler(res) {
     let doneWritten = false;
     let anyChunkWritten = false;
     let nonDataBuffer = '';
+    let upstreamFinish = null;
+    let roleSent = false;
+    let errorWritten = false;
+    let lastWriteAt = Date.now();
 
     try {
       if (!reader) {
@@ -2397,8 +2928,11 @@ function createExpressStreamHandler(res) {
           }
           const data = trimmed.slice(5).trim();
           if (data === '[DONE]') {
-            res.write('data: [DONE]\n\n');
-            doneWritten = true;
+            // 有筛子时把 [DONE] 推迟到 finale 之后，否则 tool_calls 会排在 [DONE] 后面
+            if (!sieve) {
+              res.write('data: [DONE]\n\n');
+              doneWritten = true;
+            }
             continue;
           }
 
@@ -2420,6 +2954,8 @@ function createExpressStreamHandler(res) {
                     finish_reason: 'stop',
                   }],
                 };
+                // 先放出筛子里已解析的内容/调用，再报安全警告
+                if (sieve) writeSieveFinale((data) => res.write(data), sieve, responseId, created, model, { roleSent, suppressFinal: true });
                 res.write(`data: ${JSON.stringify(warningChunk)}\n\n`);
                 doneWritten = true;
                 res.write('data: [DONE]\n\n');
@@ -2432,13 +2968,19 @@ function createExpressStreamHandler(res) {
                   code: upstreamError.code,
                 }
               };
+              if (sieve) writeSieveFinale((data) => res.write(data), sieve, responseId, created, model, { roleSent, suppressFinal: true });
               res.write(`data: ${JSON.stringify(errObj)}\n\n`);
               anyChunkWritten = true;
+              errorWritten = true;
               continue;
             }
 
-            const delta = mapUpstreamDeltaToOpenAI(parsed?.choices?.[0]?.delta);
-            if (delta || parsed?.choices?.[0]?.finish_reason) {
+            const delta = sieveDelta(sieve, mapUpstreamDeltaToOpenAI(parsed?.choices?.[0]?.delta));
+            if (parsed?.choices?.[0]?.finish_reason) upstreamFinish = parsed.choices[0].finish_reason;
+            // 筛子接管终止语义：finish_reason 由 finale 发出，上游原因经 upstreamFinish 透传
+            const finishReason = sieve ? null : (parsed?.choices?.[0]?.finish_reason || null);
+            if (delta || finishReason) {
+              if (delta && delta.role === 'assistant') roleSent = true;
               if (delta && typeof delta.content === 'string' && delta.content) {
                 writeStreamContent(delta.content);
               }
@@ -2450,11 +2992,15 @@ function createExpressStreamHandler(res) {
                 choices: [{
                   index: 0,
                   delta: delta || {},
-                  finish_reason: parsed?.choices?.[0]?.finish_reason || null,
+                  finish_reason: finishReason,
                 }],
               };
               res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+              lastWriteAt = Date.now();
               anyChunkWritten = true;
+            } else if (sieve && Date.now() - lastWriteAt >= getSieveKeepaliveMs()) {
+              res.write(': keepalive\n\n');
+              lastWriteAt = Date.now();
             }
           } catch {}
         }
@@ -2462,17 +3008,29 @@ function createExpressStreamHandler(res) {
       if (buffer.trim() && !buffer.trimStart().startsWith('data:')) {
         nonDataBuffer += buffer;
       }
+      // 顺序要紧：先判上游的纯错误体，否则 finale 会把它盖成一次空的成功响应
       if (!doneWritten && !anyChunkWritten) {
         const err = tryParseUpstreamErrorPayload(nonDataBuffer);
         if (err) {
           res.write(`data: ${JSON.stringify({ error: err })}\n\n`);
           res.write('data: [DONE]\n\n');
           doneWritten = true;
+          errorWritten = true;
         }
+      }
+      if (sieve && !doneWritten && !errorWritten && !res.writableEnded) {
+        writeSieveFinale((data) => res.write(data), sieve, responseId, created, model, { roleSent, upstreamFinish });
+        anyChunkWritten = true;
       }
     } catch (err) {
       if (!res.writableEnded) {
         const message = err && err.message ? err.message : 'stream proxy error';
+        // 中断前先释放筛子，否则已解析的内容和调用会静默丢失
+        if (sieve && !doneWritten) {
+          try {
+            writeSieveFinale((data) => res.write(data), sieve, responseId, created, model, { roleSent, suppressFinal: true });
+          } catch {}
+        }
         res.write(`data: ${JSON.stringify({ error: { message, type: 'api_error' } })}\n\n`);
       }
     } finally {
@@ -2538,9 +3096,15 @@ module.exports = {
   getBaxiaTokens,
   mapUpstreamDeltaToOpenAI,
   parseQwenSsePayload,
+  buildToolPrompt,
+  extractToolCalls,
+  createToolCallSieve,
+  buildToolAwareResponse,
+  parseIncomingMessages,
   mapUsageToOpenAI,
   tryParseUpstreamErrorPayload,
   createExpressStreamHandler,
   createExpressLogStreamHandler,
+  createLogStreamWriter,
   uuidv4,
 };

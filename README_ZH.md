@@ -229,7 +229,13 @@ wrangler deploy
 - ✅ `/v1/chat/completions` 已支持附件与多模态消息（图片/文件/音频）。
 - ✅ 支持图片理解与文档解析流程（可在对话中直接使用）。
 - ⚠️ 附件会按 Qwen Web 的流程先上传到 Qwen OSS，文件较大时请求耗时会增加。
-- ❌ **不支持工具调用** - 项目未实现 OpenAI 风格的工具/函数调用功能。
+- ✅ **支持工具调用** - `/v1/chat/completions` 支持 `tools` 与 `tool_choice`，流式与非流式均返回 OpenAI 格式的 `tool_calls` 及 `finish_reason: "tool_calls"`。多轮回路可用：把 `assistant.tool_calls` 与 `role: "tool"` 结果放回 `messages` 即可。
+  - Qwen Web 无原生 function calling，因此通过注入 Qwen 原生 `<tool_call>` 提示词格式并回解实现，准确率依赖模型表现，与原生接口不同。
+  - 位于 ``` 代码围栏或 `行内代码` 内的标记不会被执行，因此模型可以安全地讲解该格式。
+  - `tool_choice` 支持 `auto` / `none` / `required` / 指定函数。`required` 与指定函数仅为提示词约束，模型未调用时不会报错。
+  - 不校验工具名与参数 schema，请在自己的执行层校验。
+  - Qwen Web 自带工具层在无法解析你的工具名时会输出 `Tool <name> does not exists.`，该文本属于上游噪声，已在返回前剥离。
+  - 访客会话有每日用量上限。达到上限时代理返回 HTTP 429 与 `type: "rate_limit_error"`，并附上游原始信息，便于客户端正确退避。
 
 ### 限制说明（视频链接 / 大文件）
 
