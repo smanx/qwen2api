@@ -179,8 +179,10 @@ async function getBaxiaTokens(forceRefresh) {
 async function createChatSession(actualModel, chatType, retries = 3) {
   let lastErr = null;
   for (let attempt = 0; attempt <= retries; attempt++) {
-    const { bxUa, bxUmidToken, bxV, cookies } = await getBaxiaTokens(attempt > 0);
     try {
+      // 必须在 try 内：重试时刷新 token 也会走网络，抛出来会直接终结整个请求，
+      // 剩余重试全部作废，客户端只拿到一个没有响应体的 500。
+      const { bxUa, bxUmidToken, bxV, cookies } = await getBaxiaTokens(attempt > 0);
       const createHeaders = {
         'Accept': 'application/json', 'Content-Type': 'application/json',
         'bx-ua': bxUa, 'bx-umidtoken': bxUmidToken, 'bx-v': bxV,
@@ -466,11 +468,20 @@ function mapUpstreamDeltaToOpenAI(delta) {
   return Object.keys(mapped).length > 0 ? mapped : null;
 }
 
+// 上游 thinking_summary 每个事件带的是"到目前为止的完整摘要"，不是增量。
+// 直接拼接会让思考内容按平方级重复。
+function mergeReasoning(acc, fragment) {
+  if (!acc) return fragment;
+  if (fragment.startsWith(acc)) return fragment; // 累积式：整体替换
+  if (acc.endsWith(fragment)) return acc;        // 重复的尾巴
+  return acc + fragment;                         // 真正的增量
+}
+
 function parseQwenSsePayload(rawPayload) {
   const payload = typeof rawPayload === 'string' ? rawPayload : '';
   const events = [];
   const contentParts = [];
-  const reasoningParts = [];
+  let reasoningAcc = '';
   let usage = null;
 
   for (const line of payload.split('\n')) {
@@ -490,7 +501,7 @@ function parseQwenSsePayload(rawPayload) {
         events.push({ delta: delta || {}, finish_reason: finishReason });
       }
       if (delta?.content) contentParts.push(delta.content);
-      if (delta?.reasoning_content) reasoningParts.push(delta.reasoning_content);
+      if (delta?.reasoning_content) reasoningAcc = mergeReasoning(reasoningAcc, delta.reasoning_content);
     } catch (parseError) {
       void parseError;
     }
@@ -499,7 +510,7 @@ function parseQwenSsePayload(rawPayload) {
   return {
     events,
     content: contentParts.join(''),
-    reasoning_content: reasoningParts.join(''),
+    reasoning_content: reasoningAcc,
     usage,
   };
 }
@@ -714,6 +725,35 @@ function tryParseUpstreamErrorPayload(rawText) {
   }
 
   return null;
+}
+
+// 上游把配额/限流也用 HTTP 200 + 错误体返回。映射成 429 + rate_limit_error，
+// 客户端才会正确退避；当成 502 只会让它盲目重试。
+const UPSTREAM_RATE_LIMIT_RE = /upper limit|rate.?limit|too many requests|quota|限流|次数.*上限|超出.*限制/i;
+
+function upstreamErrorResponse(err, fallbackStatus = 502) {
+  const probe = `${err?.message || ''} ${err?.code || ''}`;
+  const rateLimited = UPSTREAM_RATE_LIMIT_RE.test(probe);
+  return createResponse(
+    { error: { ...err, type: rateLimited ? 'rate_limit_error' : (err?.type || 'api_error') } },
+    rateLimited ? 429 : fallbackStatus,
+  );
+}
+
+// 网络异常不能逃出处理函数：Express 会回一个没有响应体的裸 500，
+// 客户端拿不到任何可诊断的信息。伪造一个失败响应，交给既有的 !ok 分支处理。
+async function fetchUpstream(url, options) {
+  try {
+    return await fetch(url, options);
+  } catch (err) {
+    const message = err && err.message ? err.message : 'fetch failed';
+    return {
+      ok: false,
+      status: 502,
+      body: null,
+      text: async () => `Upstream request failed: ${message}`,
+    };
+  }
 }
 
 async function fetchImageAsBase64(url) {
@@ -1392,7 +1432,7 @@ async function handleImageGenerations(body, authHeader, env) {
   // 尽力把 n 映射给上游：上游未发现显式参数，只能通过 prompt 提示。
   const finalPrompt = n === 1 ? prompt : `${prompt}\n\n(Generate ${n} images.)`;
 
-  const chatResp = await fetch(`${QWEN_BASE_URL}/api/v2/chat/completions?chat_id=${chatId}`, {
+  const chatResp = await fetchUpstream(`${QWEN_BASE_URL}/api/v2/chat/completions?chat_id=${chatId}`, {
     method: 'POST',
     headers: {
       'Accept': 'application/json',
@@ -1552,7 +1592,7 @@ async function handleChatCompletions(body, authHeader, env, streamWriter) {
   });
 
   // 发送请求
-  const chatResp = await fetch(`${QWEN_BASE_URL}/api/v2/chat/completions?chat_id=${chatId}`, {
+  const chatResp = await fetchUpstream(`${QWEN_BASE_URL}/api/v2/chat/completions?chat_id=${chatId}`, {
     method: 'POST',
     headers: {
       'Accept': 'application/json', 'Content-Type': 'application/json',
@@ -1608,7 +1648,7 @@ async function handleChatCompletions(body, authHeader, env, streamWriter) {
   const upstreamErr = tryParseUpstreamErrorPayload(buffer);
   if (upstreamErr) {
     console.log(`[qwen2api][chat] Upstream returned error (HTTP 200): ${upstreamErr.message}`);
-    return createResponse({ error: upstreamErr }, 502);
+    return upstreamErrorResponse(upstreamErr);
   }
   const parsedSse = parseQwenSsePayload(buffer);
   logChatDetail('core', 'chat.completion.collected', {
@@ -2235,7 +2275,7 @@ async function handleChatCompletionsWithLogs(body, authHeader, env, streamWriter
 
   // 发送请求
   sendLog('chat.sending', { chatId });
-  const chatResp = await fetch(`${QWEN_BASE_URL}/api/v2/chat/completions?chat_id=${chatId}`, {
+  const chatResp = await fetchUpstream(`${QWEN_BASE_URL}/api/v2/chat/completions?chat_id=${chatId}`, {
     method: 'POST',
     headers: {
       'Accept': 'application/json', 'Content-Type': 'application/json',
@@ -2310,7 +2350,7 @@ async function handleChatCompletionsWithLogs(body, authHeader, env, streamWriter
   if (upstreamErr) {
     console.log(`[qwen2api][chat-log] Upstream returned error (HTTP 200): ${upstreamErr.message}`);
     sendLog('chat.response.failed', { error: upstreamErr.message });
-    return createResponse({ error: upstreamErr }, 502);
+    return upstreamErrorResponse(upstreamErr);
   }
   const parsedSse = parseQwenSsePayload(buffer);
 
@@ -2538,6 +2578,8 @@ module.exports = {
   getBaxiaTokens,
   mapUpstreamDeltaToOpenAI,
   parseQwenSsePayload,
+  upstreamErrorResponse,
+  fetchUpstream,
   mapUsageToOpenAI,
   tryParseUpstreamErrorPayload,
   createExpressStreamHandler,
